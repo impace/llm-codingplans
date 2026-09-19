@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.4.0
-// @description  大模型代码订阅对比、动态更新追踪与24小时满载极限性价比测算工具（支持可拖拽悬浮球与样式隔离）
+// @version      2.5.0
+// @description  大模型代码订阅对比、动态更新追踪与月用量自适应成本测算工具（支持可拖拽悬浮球与样式隔离）
 // @author       impace
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/impace/llm-codingplans/main/LLMCodePlansPro.user.js
@@ -107,11 +107,11 @@
             name: 'GitHub Copilot',
             category: '海外服务',
             tag: '生态基石',
-            plans: 'Free $0 | Pro $10/月 | Pro+ $39/月 | Max $100/月',
-            quotaDesc: '补全、Chat、Agent 等按 GitHub AI Credits 或计划用量管理',
+            plans: 'Free $0 | Pro $10/月 (约¥72) | Pro+ $39/月 | Max $100/月',
+            quotaDesc: '补全绝对无限量；高级 Chat / Agent 按月度 AI Credits 管理',
             models: '动态调整；Pro 支持自主选模，Pro+/Max 提供高级模型和额度',
             promos: '学生认证及开源项目维护者可申请免费',
-            traps: 'Agent 共同消耗有限的 AI 额度；不要只按“无限补全”判断重度挂机容量',
+            traps: 'Agent 模式受每月额度限制，超额后无法无限制执行复杂工程修改',
             verifiedAt: '2026-09-19（GitHub 官方 Plans）',
             links: {
                 pricing: [{ title: 'Copilot 方案详情', url: 'https://github.com/features/copilot/plans' }],
@@ -127,7 +127,7 @@
             quotaDesc: '双窗口积分制：Lite 2,000/5h、10,000/周；Pro 12,000/5h、60,000/周；Max 28,000/5h、140,000/周',
             models: 'GLM-5.3、GLM-5.3-Flash',
             promos: '非高峰时段按 50% 积分抵扣；支持连续包年折扣',
-            traps: '调价后纯价格门槛变高，建议配合年付平摊及闲时策略使用',
+            traps: '受每周积分硬顶约束，单周内连续高频编码可能提前触顶',
             verifiedAt: '2026-09-19（官方 Coding Plan 文档）',
             links: {
                 pricing: [{ title: 'Coding Plan 概览', url: 'https://docs.bigmodel.cn/cn/coding-plan/overview' }],
@@ -226,7 +226,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.4.0';
+    const APP_VERSION = '2.5.0';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
     const RENDER_REQUEST_KEY_PREFIX = 'llm_render_request_v1_';
@@ -397,9 +397,9 @@
                 return {
                     mode: 'rendered',
                     extractorId: 'volcengine-doc',
-                    selectors: ['div[class*="contentdoc-"]', 'div[class*="content-CK"]', 'main'],
-                    minLength: 300,
-                    markers: ['套餐', '模型']
+                    selectors: ['div[class*="contentdoc-"]', 'div[class*="content-CK"]', 'main', 'article'],
+                    minLength: 120,
+                    markers: []
                 };
             }
             if (parsed.hostname === 'docs.bigmodel.cn') {
@@ -407,26 +407,26 @@
                     mode: 'rendered',
                     extractorId: 'zhipu-coding-plan',
                     selectors: ['main', 'article', '[class*="markdown"]', 'body'],
-                    minLength: 500,
-                    markers: ['积分额度', '抵扣系数']
+                    minLength: 200,
+                    markers: []
                 };
             }
             if (parsed.hostname === 'www.kimi.com' && /^\/code\/?$/.test(parsed.pathname)) {
                 return {
                     mode: 'rendered',
                     extractorId: 'kimi-code-pricing',
-                    selectors: ['.kfc-pricing-content', 'main'],
-                    minLength: 180,
-                    markers: ['Plus', 'Pro', 'Max']
+                    selectors: ['.kfc-pricing-content', 'main', 'body'],
+                    minLength: 120,
+                    markers: []
                 };
             }
             if (parsed.hostname === 'grok.com' && parsed.pathname.startsWith('/plans')) {
                 return {
                     mode: 'rendered',
                     extractorId: 'grok-plans',
-                    selectors: ['main'],
-                    minLength: 260,
-                    markers: ['SuperGrok']
+                    selectors: ['main', 'body'],
+                    minLength: 180,
+                    markers: []
                 };
             }
         } catch {
@@ -507,7 +507,7 @@
         if (!req || req.state !== 'pending') return;
 
         const rule = req.rule || {};
-        const minLength = Math.max(120, Number(rule.minLength) || 180);
+        const minLength = Math.max(80, Number(rule.minLength) || 120);
         const startedAt = Date.now();
         let lastText = '', stableRounds = 0;
 
@@ -515,10 +515,8 @@
             const text = extractRenderedText(rule);
             stableRounds = text && text === lastText ? stableRounds + 1 : 0;
             lastText = text;
-            const markers = rule.markers || [];
-            const markerHits = markers.filter(m => text.toLowerCase().includes(String(m).toLowerCase()));
             const blocked = /access denied|forbidden|just a moment|enable cookies|verify you are human|captcha|安全验证|人机验证/i.test(text);
-            const enough = text.length >= minLength && !blocked && (!markers.length || markerHits.length > 0);
+            const enough = text.length >= minLength && !blocked;
             const timedOut = Date.now() - startedAt > 22000;
 
             if ((!enough || stableRounds < 2) && !timedOut) {
@@ -553,8 +551,7 @@
                 rule: {
                     extractorId: rule.extractorId || 'generic',
                     selectors: rule.selectors || ['main', 'article', 'body'],
-                    minLength: rule.minLength || 180,
-                    markers: rule.markers || []
+                    minLength: rule.minLength || 120
                 }
             });
 
@@ -599,7 +596,7 @@
             : await requestUpdateCheck(url, previous, requestOptions);
 
         if (rule.mode !== 'rendered' && (!result.ok || result.weak) && typeof GM_openInTab === 'function') {
-            const renderedRule = { ...rule, mode: 'rendered', minLength: 180 };
+            const renderedRule = { ...rule, mode: 'rendered', minLength: 120 };
             const fallbackRes = await requestRenderedSource(url, previous, renderedRule);
             if (fallbackRes.ok) result = fallbackRes;
         }
@@ -793,7 +790,7 @@
         <div class="llm-tabs">
             <div class="llm-tab active" data-target="matrix">📊 套餐比价矩阵</div>
             <div class="llm-tab" data-target="radar">📢 动态更新雷达</div>
-            <div class="llm-tab" data-target="calc">🧮 24h满载性价比测算</div>
+            <div class="llm-tab" data-target="calc">🧮 月用量成本测算</div>
             <div class="llm-tab" data-target="settings">⚙️ 厂商配置</div>
         </div>
         <div class="llm-body" id="llm-body-content"></div>
@@ -933,140 +930,159 @@
         bodyContent.querySelector('#llm-radar-refresh').addEventListener('click', renderRadar);
     }
 
-    // ======================== 6. 24h满载性价比测算 (多层瓶颈约束模型) ========================
+    // ======================== 6. 月用量自适应测算引擎 (核心重构) ========================
     function renderCalc() {
         bodyContent.innerHTML = `
             <div class="llm-calc-box">
-                <div style="font-weight: 600; margin-bottom: 12px; font-size: 14px;">🧮 24小时满载挂机 · 绝对性价比极限测算</div>
+                <div style="font-weight: 600; margin-bottom: 12px; font-size: 14px;">🧮 月度代码用量 · 真实支出成本测算</div>
                 <div class="llm-input-group">
-                    <span>自动化脚本平均单请求 Token：</span>
-                    <span><input type="number" id="calc-req-token-k" class="llm-input-num" value="25" min="1" max="1000" /> K Tokens</span>
+                    <span>你的预估月度总 Token 消耗：</span>
+                    <span><input type="number" id="calc-monthly-tokens-m" class="llm-input-num" value="200" min="1" max="100000" /> M Tokens</span>
                 </div>
                 <div class="llm-input-group">
-                    <span>夜间 / 闲时任务配比 (享超低扣费)：</span>
-                    <select id="calc-night-ratio" class="llm-input-num" style="width:140px; text-align:left;">
-                        <option value="0.0">0% (全在白天高峰挂)</option>
-                        <option value="0.4">40% (全天均匀挂机)</option>
-                        <option value="1.0" selected>100% (全在夜间低谷挂)</option>
-                    </select>
+                    <span>夜间 / 闲时任务占比 (可直接输入 0~100)：</span>
+                    <span><input type="number" id="calc-night-ratio-input" class="llm-input-num" value="40" min="0" max="100" /> %</span>
                 </div>
                 <div class="llm-muted" style="margin-top:6px;">
-                    💡 算法原理：全月共 144 个 5 小时窗口。测算引擎自动对 <strong>[5h单窗口 × 144]</strong>、<strong>[周额度 × 4.28]</strong> 和 <strong>[月度总硬顶]</strong> 取最小值，推导 24h 挂机不间断能榨出的<strong>极限安全容量</strong>与<strong>单位 Token 真实成本</strong>。
+                    💡 算法说明：输入你真实的月度 Token 规模。若套餐配额足够，按套餐原价计费；若因周限额或 5h 窗口导致额度不足，算法自动按 <strong>[套餐费 + 缺口 Token × DeepSeek API 单价]</strong> 测算真实月花费，并提示短板。
                 </div>
             </div>
-            <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">🏆 24小时满载挂机：极限容量与单位成本排行 (越低越合算)</div>
+            <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">🏆 满足该用量的真实月支出排行（花费越低越合算）：</div>
             <div id="llm-calc-results"></div>
         `;
 
         function recalculate() {
-            const reqK = Math.max(1, parseFloat(document.getElementById('calc-req-token-k').value) || 25);
-            const nightRatio = parseFloat(document.getElementById('calc-night-ratio').value) || 1.0;
-            const reqTokens = reqK * 1000;
+            const targetM = Math.max(1, parseFloat(document.getElementById('calc-monthly-tokens-m').value) || 200);
+            const nightPercent = Math.min(100, Math.max(0, parseFloat(document.getElementById('calc-night-ratio-input').value) || 0));
+            const nightRatio = nightPercent / 100;
 
-            // 厂商满载榨干模型 (30天 144个 5h 窗口)
-            // 智谱积分折算: 假设中等模型 1 Token ≈ 0.001 积分 (非高峰5折)
-            const zhipuPointPerToken = 0.0008 * (1 - nightRatio * 0.5);
+            // 统一 API 兜底基准（按 DeepSeek V4.1 Flash 混合算力折合单价：输入缓存0.04，未命中2.0，输出4.0，闲时半价）
+            const dsUnitPricePerM = (0.04 * 0.8 + 2.0 * 0.2 + 4.0 * 0.1) * (1 - nightRatio * 0.5);
 
-            const profiles = [
+            // 各家套餐全月安全容量推导（单位：M Tokens）
+            const plans = [
                 {
-                    name: '火山方舟 (Coding Plan Lite)',
-                    price: 40,
-                    promoPrice: 9.9,
-                    // 5h=1200次, 月顶=18,000次。5h*144=172,800次, 但被月顶 18,000 次卡死
-                    maxRequests: 18000,
-                    burst5h: '1,200 次/5h',
-                    bottleneck: '月度总量硬顶 18,000 次',
-                    get maxTokensB() { return (this.maxRequests * reqTokens) / 1e9; }
+                    name: 'DeepSeek 原生 API',
+                    tier: '按量实时计费',
+                    basePrice: 0,
+                    maxCapacityM: 9999999, // 无上限
+                    bottleneck: '随用随扣，无月度闲置浪费',
+                    calcCost: (m) => m * dsUnitPricePerM
                 },
                 {
-                    name: '百度千帆 (Coding Plan Lite)',
-                    price: 40,
-                    promoPrice: 19.9,
-                    // 5h=1200次, 周=9000次(月3.85万), 月顶=18,000次。最终卡死在 18,000次
-                    maxRequests: 18000,
-                    burst5h: '1,200 次/5h',
-                    bottleneck: '月度总量硬顶 18,000 次',
-                    get maxTokensB() { return (this.maxRequests * reqTokens) / 1e9; }
+                    name: '火山方舟 (Coding Plan)',
+                    tier: targetM <= 450 ? 'Lite 档位 (¥40/月)' : 'Pro 档位 (¥200/月)',
+                    basePrice: targetM <= 450 ? 40 : 200,
+                    // Lite 每月 18,000 次，按平均每次交互 25k Tokens 折合约 450M；Pro 9万次折约 2,250M
+                    maxCapacityM: targetM <= 450 ? 450 : 2250,
+                    bottleneck: targetM <= 450 ? '每月 18,000 次调用上限' : '每月 90,000 次调用上限'
                 },
                 {
-                    name: '阿里百炼 (Token Plan Lite)',
-                    price: 39,
-                    promoPrice: 39,
-                    // 每周 2,500 Credits, 月度=10,714 Credits. 假设夜间2折, 1M约消耗 40~70 Credits
-                    // 极限折合约 0.25B ~ 0.4B
-                    maxTokensB: 0.18 * (1 + nightRatio * 1.5),
-                    burst5h: '受每周 2,500 分动态节流',
-                    bottleneck: '每 7 天 2,500 Credits 硬限额'
+                    name: '百度千帆 (Coding Plan)',
+                    tier: targetM <= 450 ? 'Lite 档位 (¥40/月)' : 'Pro 档位 (¥200/月)',
+                    basePrice: targetM <= 450 ? 40 : 200,
+                    maxCapacityM: targetM <= 450 ? 450 : 2250,
+                    bottleneck: targetM <= 450 ? '每月 18,000 次硬限额' : '每月 90,000 次硬限额'
                 },
                 {
-                    name: '小米 MiMo (Token Plan Lite)',
-                    price: 39,
-                    promoPrice: 39,
-                    // 4.1B Credits 固定池, 夜间0.8倍扣费
-                    maxTokensB: 0.8 * (1 + nightRatio * 0.25),
-                    burst5h: '无5小时硬卡顿，全月自由跑',
-                    bottleneck: '月度 4.1B Credits 总算力池'
+                    name: '阿里百炼 (Token Plan)',
+                    tier: targetM <= 180 ? 'Lite 档位 (¥39/月)' : (targetM <= 700 ? 'Standard 档位 (¥139/月)' : 'Pro 档位 (¥499/月)'),
+                    basePrice: targetM <= 180 ? 39 : (targetM <= 700 ? 139 : 499),
+                    // 每周 Credits，夜间享超低 2 折抵扣
+                    maxCapacityM: (targetM <= 180 ? 180 : (targetM <= 700 ? 700 : 2800)) * (1 + nightRatio * 1.2),
+                    bottleneck: '每 7 天 Credits 硬顶与 5h 滑动节流'
                 },
                 {
-                    name: '智谱 AI (Coding Plan Lite)',
-                    price: 118,
-                    promoPrice: 94,
-                    // 5h=2000分(*144=28.8万分), 但周顶=10,000分(月42,857分)。被周顶卡死！
-                    maxTokensB: (42857 / zhipuPointPerToken) / 1e9,
-                    burst5h: '2,000 积分/5h (约25h耗尽周额度)',
-                    bottleneck: '每 7 天 10,000 积分硬限额'
+                    name: '小米 MiMo (Token Plan)',
+                    tier: targetM <= 800 ? 'Lite 档位 (¥39/月)' : (targetM <= 2200 ? 'Standard 档位 (¥99/月)' : 'Pro 档位 (¥329/月)'),
+                    basePrice: targetM <= 800 ? 39 : (targetM <= 2200 ? 99 : 329),
+                    // 4.1B / 11B Credits, 夜间0.8倍
+                    maxCapacityM: (targetM <= 800 ? 800 : (targetM <= 2200 ? 2200 : 7600)) * (1 + nightRatio * 0.25),
+                    bottleneck: '月度固定 Credits 算力包总量'
                 },
                 {
-                    name: 'DeepSeek 原生 API (按量)',
-                    price: 0,
-                    promoPrice: 0,
-                    maxTokensB: 999, // 无上限
-                    burst5h: '无限制 (按账户并发等级)',
-                    bottleneck: '仅受账户并发限额约束'
+                    name: 'GitHub Copilot Pro',
+                    tier: 'Pro ($10/月 约¥72)',
+                    basePrice: 72,
+                    maxCapacityM: 300, // 补全无限，Agent 模式折合基础额度
+                    bottleneck: '高级 Agent 模式依赖每月赠送额度'
+                },
+                {
+                    name: '智谱 AI (Coding Plan)',
+                    tier: targetM <= 350 ? 'Lite 档位 (¥118/月)' : 'Pro 档位 (¥538/月)',
+                    basePrice: targetM <= 350 ? 118 : 538,
+                    // 每周 1万 / 6万 积分硬顶，非高峰 5 折
+                    maxCapacityM: (targetM <= 350 ? 350 : 2100) * (1 + nightRatio * 0.5),
+                    bottleneck: '每 7 天积分硬顶，突击编码易提前用尽'
                 }
             ];
 
-            const results = profiles.map(p => {
-                if (p.price === 0) {
-                    // DeepSeek 按量折算每 1M 单价
-                    const unitPricePerM = (0.04 * 0.8 + 2.0 * 0.2) * (1 - nightRatio * 0.5);
+            const results = plans.map(p => {
+                if (p.calcCost) {
+                    const cost = p.calcCost(targetM);
                     return {
                         ...p,
-                        unitCostPerM: unitPricePerM,
-                        capDesc: '按需付费（无上限）',
-                        score: unitPricePerM
+                        totalCost: cost,
+                        coverage: 1.0,
+                        missingM: 0,
+                        desc: '随用随扣，100% 刚好满足'
                     };
                 }
-                const totalM = p.maxTokensB * 1000;
-                const unitCostPerM = (p.price / totalM);
+                const cap = p.maxCapacityM;
+                if (cap >= targetM) {
+                    // 套餐完全够用
+                    return {
+                        ...p,
+                        totalCost: p.basePrice,
+                        coverage: 1.0,
+                        missingM: 0,
+                        desc: `套餐容量约 ${cap.toFixed(0)}M（完全覆盖）`
+                    };
+                }
+                // 套餐不够用：基础价 + 缺口按 API 补足
+                const missing = targetM - cap;
+                const extraCost = missing * dsUnitPricePerM;
+                const total = p.basePrice + extraCost;
                 return {
                     ...p,
-                    unitCostPerM: unitCostPerM,
-                    capDesc: `极限榨干约 ${p.maxTokensB.toFixed(2)} B / 月`,
-                    score: unitCostPerM
+                    totalCost: total,
+                    coverage: cap / targetM,
+                    missingM: missing,
+                    desc: `套餐抗 ${cap.toFixed(0)}M，缺口 ${missing.toFixed(0)}M 需补 API 约 ¥${extraCost.toFixed(0)}`
                 };
             });
 
-            results.sort((a, b) => a.score - b.score);
+            // 按真实总支出升序排序
+            results.sort((a, b) => a.totalCost - b.totalCost);
 
             document.getElementById('llm-calc-results').innerHTML = results.map((item, idx) => `
                 <div class="llm-rank-item">
                     <div style="max-width: 72%;">
-                        <strong style="color: ${idx === 0 ? '#3fb950' : '#58a6ff'};">#${idx + 1} ${escapeHtml(item.name)}</strong>
-                        <div class="llm-muted" style="margin-top:2px;">
-                            ⚡ 峰值爆发：${escapeHtml(item.burst5h)} | 🚧 真正短板：<span style="color:#f85149;">${escapeHtml(item.bottleneck)}</span>
+                        <div>
+                            <strong style="color: ${idx === 0 ? '#3fb950' : '#58a6ff'};">#${idx + 1} ${escapeHtml(item.name)}</strong>
+                            <span class="llm-muted" style="margin-left: 6px;">[${escapeHtml(item.tier)}]</span>
+                        </div>
+                        <div class="llm-muted" style="margin-top:3px;">
+                            ${escapeHtml(item.desc)}
+                        </div>
+                        <div class="llm-muted" style="font-size:10px; color:#8b949e;">
+                            约束短板：${escapeHtml(item.bottleneck)}
                         </div>
                     </div>
                     <div style="text-align: right;">
-                        <strong style="color: #3fb950;">约 ¥${item.unitCostPerM.toFixed(3)} / M</strong>
-                        <div class="llm-muted">${item.capDesc}</div>
+                        <strong style="color: ${item.missingM === 0 ? '#3fb950' : '#e3b341'}; font-size:14px;">
+                            约 ¥${item.totalCost.toFixed(0)} / 月
+                        </strong>
+                        <div class="llm-muted" style="font-size:11px;">
+                            覆盖率 ${(item.coverage * 100).toFixed(0)}%
+                        </div>
                     </div>
                 </div>
             `).join('');
         }
 
-        document.getElementById('calc-req-token-k').addEventListener('input', recalculate);
-        document.getElementById('calc-night-ratio').addEventListener('change', recalculate);
+        document.getElementById('calc-monthly-tokens-m').addEventListener('input', recalculate);
+        document.getElementById('calc-night-ratio-input').addEventListener('input', recalculate);
         recalculate();
     }
 
