@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.5.0
-// @description  大模型代码订阅对比、动态更新追踪与月用量自适应成本测算工具（支持可拖拽悬浮球与样式隔离）
+// @version      2.7.0
+// @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/impace/llm-codingplans/main/LLMCodePlansPro.user.js
@@ -226,12 +226,91 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.5.0';
+    const APP_VERSION = '2.7.0';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
+    const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
     const RENDER_REQUEST_KEY_PREFIX = 'llm_render_request_v1_';
+    const AI_SNAPSHOT_KEY_PREFIX = 'llm_ai_snapshot_v1_';
+    const CALC_CART_KEY = 'llm_calc_cart_v1';
     const SETTINGS_SCHEMA_VERSION = 3;
     const MAX_PROBE_BYTES = 500000;
+    const MAX_AI_EXCERPT_CHARS = 18000;
+
+    const DEFAULT_APP_SETTINGS = {
+        ai: {
+            enabled: false,
+            endpoint: 'https://api.openai.com/v1/chat/completions',
+            model: 'gpt-4o-mini',
+            apiKey: '',
+            runOnFirstCheck: false,
+            maxExcerptChars: 14000
+        },
+        currency: {
+            display: 'CNY',
+            rates: 'USD=7.20\nEUR=8.00\nGBP=9.30\nJPY=0.050\nHKD=0.92\nKRW=0.0052\nSGD=5.35\nCAD=5.20\nAUD=4.70'
+        }
+    };
+
+    // 这里只放“可公开核对或明确标注未知”的基准，不把调用次数/积分
+    // 擅自换算成 Token。未知容量由用户在购物车中按自己的实测填写。
+    const CART_ACCOUNT_ROWS = [
+        { id: 'bailian-lite', providerId: 'bailian', plan: 'Lite', price: 39, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '约 2,500 Credits / 7 天；Credits 与 Token 的换算需实测', evidence: '官方给出 Credits，未给出稳定 Token 等价物' },
+        { id: 'bailian-essential', providerId: 'bailian', plan: 'Essential', price: 79, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '约 5,625 Credits / 7 天；Credits 与 Token 的换算需实测', evidence: '官方给出 Credits，未给出稳定 Token 等价物' },
+        { id: 'bailian-standard', providerId: 'bailian', plan: 'Standard', price: 139, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '约 10,000 Credits / 7 天；Credits 与 Token 的换算需实测', evidence: '官方给出 Credits，未给出稳定 Token 等价物' },
+        { id: 'bailian-pro', providerId: 'bailian', plan: 'Pro', price: 499, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '约 40,000 Credits / 7 天；Credits 与 Token 的换算需实测', evidence: '官方给出 Credits，未给出稳定 Token 等价物' },
+        { id: 'volcengine-lite', providerId: 'volcengine', plan: 'Lite', price: 40, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '18,000 次/月、1,200 次/5 小时；Token 上限需实测', evidence: '官方给出请求次数，没有固定 Token 月容量' },
+        { id: 'volcengine-pro', providerId: 'volcengine', plan: 'Pro', price: 200, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '90,000 次/月；Token 上限需实测', evidence: '官方给出请求次数，没有固定 Token 月容量' },
+        { id: 'qianfan-lite', providerId: 'qianfan', plan: 'Lite', price: 40, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '18,000 次/月、1,200 次/5 小时；Token 上限需实测', evidence: '官方给出请求次数，没有固定 Token 月容量' },
+        { id: 'qianfan-pro', providerId: 'qianfan', plan: 'Pro', price: 200, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '90,000 次/月、6,000 次/5 小时；Token 上限需实测', evidence: '官方给出请求次数，没有固定 Token 月容量' },
+        { id: 'zhipu-lite', providerId: 'zhipu', plan: 'Lite', price: 118, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '10,000 积分/周；积分与 Token 的换算需实测', evidence: '官方给出积分窗口，没有稳定 Token 月容量' },
+        { id: 'zhipu-pro', providerId: 'zhipu', plan: 'Pro', price: 538, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '60,000 积分/周；积分与 Token 的换算需实测', evidence: '官方给出积分窗口，没有稳定 Token 月容量' },
+        { id: 'zhipu-max', providerId: 'zhipu', plan: 'Max', price: 1078, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '140,000 积分/周；积分与 Token 的换算需实测', evidence: '官方给出积分窗口，没有稳定 Token 月容量' },
+        { id: 'tencent-standard', providerId: 'tencent', plan: 'Standard', price: 99, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '积分按模型系数抵扣；Token 上限需实测', evidence: '官方给出积分制，没有统一 Token 月容量' },
+        { id: 'tencent-pro', providerId: 'tencent', plan: 'Pro', price: 299, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '积分按模型系数抵扣；Token 上限需实测', evidence: '官方给出积分制，没有统一 Token 月容量' },
+        { id: 'tencent-max', providerId: 'tencent', plan: 'Max', price: 599, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '积分按模型系数抵扣；Token 上限需实测', evidence: '官方给出积分制，没有统一 Token 月容量' },
+        { id: 'mimo-lite', providerId: 'mimo', plan: 'Lite', price: 39, currency: 'CNY', capacityB: 4.1, capacityMode: 'official-credit', bottleneck: '月度固定 4.1B Credits', evidence: '官方 Token Plan 标示 4.1B；需确认 Credits 与你的 Token 口径是否一致' },
+        { id: 'mimo-standard', providerId: 'mimo', plan: 'Standard', price: 99, currency: 'CNY', capacityB: 11, capacityMode: 'official-credit', bottleneck: '月度固定 11B Credits', evidence: '官方 Token Plan 标示 11B；需确认 Credits 与你的 Token 口径是否一致' },
+        { id: 'mimo-pro', providerId: 'mimo', plan: 'Pro', price: 329, currency: 'CNY', capacityB: 38, capacityMode: 'official-credit', bottleneck: '月度固定 38B Credits', evidence: '官方 Token Plan 标示 38B；需确认 Credits 与你的 Token 口径是否一致' },
+        { id: 'mimo-max', providerId: 'mimo', plan: 'Max', price: 659, currency: 'CNY', capacityB: 82, capacityMode: 'official-credit', bottleneck: '月度固定 82B Credits', evidence: '官方 Token Plan 标示 82B；需确认 Credits 与你的 Token 口径是否一致' },
+        { id: 'kimi-plus', providerId: 'kimi', plan: 'Plus', price: 79, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '会员等级额度；官方未公开稳定 Token 月容量', evidence: '官方按等级描述，需用户实测' },
+        { id: 'kimi-pro', providerId: 'kimi', plan: 'Pro', price: 159, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '会员等级额度；官方未公开稳定 Token 月容量', evidence: '官方按等级描述，需用户实测' },
+        { id: 'kimi-max', providerId: 'kimi', plan: 'Max', price: 559, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '会员等级额度；官方未公开稳定 Token 月容量', evidence: '官方按等级描述，需用户实测' },
+        { id: 'copilot-free', providerId: 'copilot', plan: 'Free', price: 0, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '补全与高级请求分开；Token 上限不公开', evidence: '官方以高级请求/额度说明，不能直接换算 Token' },
+        { id: 'copilot-pro', providerId: 'copilot', plan: 'Pro', price: 10, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '高级 Chat / Agent 按月度 AI Credits 管理', evidence: '官方以 Credits 说明，需用户实测' },
+        { id: 'copilot-pro-plus', providerId: 'copilot', plan: 'Pro+', price: 39, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '高级 Chat / Agent 按月度 AI Credits 管理', evidence: '官方以 Credits 说明，需用户实测' },
+        { id: 'copilot-max', providerId: 'copilot', plan: 'Max', price: 100, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '高级 Chat / Agent 按月度 AI Credits 管理', evidence: '官方以 Credits 说明，需用户实测' },
+        { id: 'openai-go', providerId: 'openai', plan: 'Go', price: 8, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '计划按消息、模型和深度思考计量；Token 上限不公开', evidence: '官方计划倍数/消息额度不能直接换算 Token' },
+        { id: 'openai-plus', providerId: 'openai', plan: 'Plus', price: 20, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '计划按消息、模型和深度思考计量；Token 上限不公开', evidence: '官方计划倍数/消息额度不能直接换算 Token' },
+        { id: 'openai-pro', providerId: 'openai', plan: 'Pro', price: 100, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '按模型、深度思考和工具链消耗；Token 上限不公开', evidence: '官方计划倍数/消息额度不能直接换算 Token' },
+        { id: 'grok-lite', providerId: 'grok', plan: 'SuperGrok Lite', price: null, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '官方以相对倍数展示；固定 Token 月容量未公开', evidence: '价格/额度需按当前地区页面填写' },
+        { id: 'grok-standard', providerId: 'grok', plan: 'SuperGrok', price: null, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '官方以相对倍数展示；固定 Token 月容量未公开', evidence: '价格/额度需按当前地区页面填写' },
+        { id: 'grok-plus', providerId: 'grok', plan: 'SuperGrok Plus', price: null, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '官方以相对倍数展示；固定 Token 月容量未公开', evidence: '价格/额度需按当前地区页面填写' },
+        { id: 'grok-heavy', providerId: 'grok', plan: 'SuperGrok Heavy', price: null, currency: 'USD', capacityB: null, capacityMode: 'unknown', bottleneck: '官方以相对倍数展示；固定 Token 月容量未公开', evidence: '价格/额度需按当前地区页面填写' }
+    ];
+
+    const API_COST_PROFILES = [
+        {
+            id: 'deepseek-flash-mixed',
+            name: 'DeepSeek V4.1 Flash 混合基准',
+            inputCache: 0.04,
+            inputMiss: 2,
+            output: 4,
+            outputShare: 0.10,
+            cacheHitShare: 0.80,
+            note: '按每百万 Token；用于估算缺口，不代表订阅可调用模型的实际单价'
+        },
+        {
+            id: 'custom',
+            name: '自定义 API 兜底单价',
+            inputCache: 0,
+            inputMiss: 0,
+            output: 0,
+            outputShare: 0,
+            cacheHitShare: 0,
+            note: '直接填写人民币 / B Token'
+        }
+    ];
 
     function escapeHtml(value) {
         return String(value ?? '')
@@ -366,6 +445,381 @@
         GM_setValue(PROVIDER_SETTINGS_KEY, settings);
     }
 
+    function mergeSettings(base, override) {
+        const source = override && typeof override === 'object' ? override : {};
+        return {
+            ...base,
+            ...source,
+            ai: { ...base.ai, ...(source.ai || {}) },
+            currency: { ...base.currency, ...(source.currency || {}) }
+        };
+    }
+
+    function readAppSettings() {
+        return mergeSettings(DEFAULT_APP_SETTINGS, GM_getValue(APP_SETTINGS_KEY, {}));
+    }
+
+    function saveAppSettings(settings) {
+        GM_setValue(APP_SETTINGS_KEY, mergeSettings(DEFAULT_APP_SETTINGS, settings));
+    }
+
+    function aiSnapshotKey(url) {
+        return AI_SNAPSHOT_KEY_PREFIX + hashText(url);
+    }
+
+    function normalizeCurrencyCode(value) {
+        const raw = String(value || '').trim().toUpperCase();
+        const aliases = {
+            '$': 'USD', 'US$': 'USD', 'USD$': 'USD',
+            '￥': 'CNY', '¥': 'CNY', 'RMB': 'CNY', 'CNH': 'CNY',
+            '€': 'EUR', '£': 'GBP', '₩': 'KRW', '₹': 'INR', 'HK$': 'HKD', 'S$': 'SGD', 'A$': 'AUD', 'C$': 'CAD',
+            '元': 'CNY', '日元': 'JPY', '韩元': 'KRW'
+        };
+        return aliases[raw] || raw || 'UNKNOWN';
+    }
+
+    function parseFxRates(value) {
+        const rates = { CNY: 1 };
+        String(value || '').split(/\r?\n/).forEach(line => {
+            const match = line.trim().match(/^([A-Za-z]{3})\s*=\s*([0-9]+(?:\.[0-9]+)?)$/);
+            if (!match) return;
+            const code = normalizeCurrencyCode(match[1]);
+            const rate = Number(match[2]);
+            if (/^[A-Z]{3}$/.test(code) && Number.isFinite(rate) && rate > 0) rates[code] = rate;
+        });
+        return rates;
+    }
+
+    function currencySymbol(code) {
+        return ({ CNY: '¥', USD: '$', EUR: '€', GBP: '£', JPY: '¥', KRW: '₩', INR: '₹', HKD: 'HK$', SGD: 'S$', AUD: 'A$', CAD: 'C$' })[code] || code;
+    }
+
+    function inferCurrency(text, url) {
+        const source = String(text || '');
+        const explicit = source.match(/(?:currency|currency\s*code|币种|价格单位|prices?\s+in|priced\s+in|billing\s+in|金额)\s*[:：]?\s*(USD|EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/i)
+            || source.match(/(?:^|[^\w])(USD|EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\s*(?=[0-9$€£¥￥])/i)
+            || source.match(/[0-9][0-9,.]*\s*(USD|EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/i);
+        if (explicit) return normalizeCurrencyCode(explicit[1]);
+        if (/[€]/.test(source)) return 'EUR';
+        if (/[£]/.test(source)) return 'GBP';
+        if (/[₩]/.test(source)) return 'KRW';
+        if (/[₹]/.test(source)) return 'INR';
+        if (/HK\$/.test(source)) return 'HKD';
+        if (/S\$/.test(source)) return 'SGD';
+        if (/A\$/.test(source)) return 'AUD';
+        if (/C\$/.test(source)) return 'CAD';
+        if (/[¥￥]/.test(source)) {
+            try {
+                const host = new URL(url).hostname;
+                if (host.endsWith('.jp') || host.includes('co.jp')) return 'JPY';
+                if (host.endsWith('.cn') || host.includes('bigmodel') || host.includes('volcengine') || host.includes('baidu') || host.includes('aliyun') || host.includes('tencent') || host.includes('mimo.mi') || host.includes('kimi.com')) return 'CNY';
+            } catch {}
+            return 'UNKNOWN';
+        }
+        if (/\bUS\s*\$|\$/.test(source)) return 'USD';
+        try {
+            const host = new URL(url).hostname;
+            if (host.endsWith('.cn') || host.includes('bigmodel') || host.includes('volcengine') || host.includes('baidu') || host.includes('aliyun') || host.includes('tencent') || host.includes('mimo.mi') || host.includes('kimi.com')) return 'CNY';
+            if (host.endsWith('.jp')) return 'JPY';
+            if (host.endsWith('.uk')) return 'GBP';
+            if (host === 'github.com' || host.endsWith('.github.com') || host.endsWith('openai.com') || host.endsWith('x.ai') || host === 'grok.com') return 'USD';
+        } catch {}
+        return 'UNKNOWN';
+    }
+
+    function convertToCny(amount, currency, rates) {
+        const value = Number(amount);
+        const code = normalizeCurrencyCode(currency);
+        return Number.isFinite(value) && rates[code] ? value * rates[code] : NaN;
+    }
+
+    function convertCurrency(amount, fromCurrency, toCurrency, rates) {
+        const value = Number(amount);
+        const from = normalizeCurrencyCode(fromCurrency);
+        const to = normalizeCurrencyCode(toCurrency);
+        if (!Number.isFinite(value)) return NaN;
+        if (from === to) return value;
+        const cny = convertToCny(value, from, rates);
+        return Number.isFinite(cny) && rates[to] ? cny / rates[to] : NaN;
+    }
+
+    function extractPriceFacts(text, url) {
+        const source = String(text || '');
+        const settings = readAppSettings();
+        const rates = parseFxRates(settings.currency.rates);
+        const inferred = inferCurrency(source, url);
+        const displayCurrency = rates[normalizeCurrencyCode(settings.currency.display)] ? normalizeCurrencyCode(settings.currency.display) : 'CNY';
+        const facts = [];
+        const seen = new Set();
+        const patterns = [
+            /(?:USD|US\$|(?<![A-Za-z])\$)\s*([0-9][0-9,.]*)/gi,
+            /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:USD|US\$|\$)(?!\s*[0-9])/gi,
+            /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/gi,
+            /(?:EUR|€)\s*([0-9][0-9,.]*)/gi,
+            /(?:GBP|£)\s*([0-9][0-9,.]*)/gi,
+            /(?:JPY|¥)\s*([0-9][0-9,.]*)/gi,
+            /(?:CNY|RMB|￥|¥)\s*([0-9][0-9,.]*)/gi,
+            /(?:HKD|HK\$)\s*([0-9][0-9,.]*)/gi,
+            /(?:KRW|₩)\s*([0-9][0-9,.]*)/gi,
+            /(?:SGD|S\$)\s*([0-9][0-9,.]*)/gi,
+            /(?:CAD|C\$)\s*([0-9][0-9,.]*)/gi,
+            /(?:AUD|A\$)\s*([0-9][0-9,.]*)/gi,
+            /(?:INR|₹)\s*([0-9][0-9,.]*)/gi
+        ];
+        patterns.forEach(pattern => {
+            for (const match of source.matchAll(pattern)) {
+                const token = match[0].replace(/\s+/g, '');
+                const amount = Number(String(match[1]).replace(/,/g, ''));
+                const marker = token + '|' + amount;
+                if (!Number.isFinite(amount) || seen.has(marker)) continue;
+                seen.add(marker);
+                let currency = inferCurrency(token, url);
+                if (currency === 'UNKNOWN' && /[¥￥]/.test(token)) {
+                    try {
+                        const host = new URL(url).hostname;
+                        if (host.endsWith('.jp') || host.includes('co.jp')) currency = 'JPY';
+                        if (host.endsWith('.cn') || host.includes('bigmodel') || host.includes('volcengine') || host.includes('baidu') || host.includes('aliyun') || host.includes('tencent') || host.includes('mimo.mi') || host.includes('kimi.com')) currency = 'CNY';
+                    } catch {}
+                }
+                if (currency === 'UNKNOWN' && !/[¥￥]/.test(token)) currency = inferred;
+                facts.push({
+                    raw: token,
+                    amount,
+                    currency,
+                    amountCny: convertToCny(amount, currency, rates),
+                    amountDisplay: convertCurrency(amount, currency, displayCurrency, rates)
+                });
+            }
+        });
+        return {
+            inferredCurrency: inferred,
+            displayCurrency,
+            rates,
+            prices: facts.slice(0, 30)
+        };
+    }
+
+    function extractDeterministicFacts(text, url) {
+        const source = String(text || '');
+        const priceFacts = extractPriceFacts(source, url);
+        const planNames = ['Lite', 'Essential', 'Standard', 'Pro', 'Pro+', 'Plus', 'Max', 'Heavy', 'Ultra', 'Team', 'Go'];
+        const plans = planNames.filter(name => new RegExp('(^|[^A-Za-z])' + name.replace('+', '\\+') + '(?=$|[^A-Za-z])', 'i').test(source));
+        const modelEvents = (source.match(/模型(?:新增|上线|下线|更新)/g) || []).length;
+        const signals = [
+            priceFacts.prices.length ? '价格 ' + priceFacts.prices.length + ' 项' : '',
+            plans.length ? '套餐 ' + plans.join('、') : '',
+            modelEvents ? '模型动态 ' + modelEvents + ' 条' : ''
+        ].filter(Boolean);
+        const confidence = source.length < 180 ? 'low' : (signals.length >= 2 ? 'medium' : 'low');
+        return { ...priceFacts, plans, modelEvents, signals, confidence };
+    }
+
+    function buildAiExcerpt(text) {
+        const source = sanitizeProbeText(text);
+        if (source.length <= MAX_AI_EXCERPT_CHARS) return source;
+        const keywords = /(价格|定价|套餐|额度|限额|积分|credits?|token|quota|monthly|yearly|模型|model|plan|price)/gi;
+        const pieces = [];
+        let match;
+        while ((match = keywords.exec(source)) && pieces.join('\n').length < MAX_AI_EXCERPT_CHARS * 0.75) {
+            const start = Math.max(0, match.index - 900);
+            const end = Math.min(source.length, match.index + 2200);
+            pieces.push(source.slice(start, end));
+        }
+        const joined = pieces.join('\n---\n');
+        if (joined.length >= 1200) return joined.slice(0, MAX_AI_EXCERPT_CHARS);
+        return (source.slice(0, 7000) + '\n---\n' + source.slice(-7000)).slice(0, MAX_AI_EXCERPT_CHARS);
+    }
+
+    function parseJsonFromModelText(value) {
+        const fence = String.fromCharCode(96).repeat(3);
+        const raw = String(value || '').trim()
+            .replace(new RegExp('^' + fence + '(?:json)?\\s*', 'i'), '')
+            .replace(new RegExp('\\s*' + fence + '$'), '');
+        try { return JSON.parse(raw); } catch {}
+        const start = raw.indexOf('{');
+        const end = raw.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+            try { return JSON.parse(raw.slice(start, end + 1)); } catch {}
+        }
+        return null;
+    }
+
+    function normalizeAiExtraction(value, rates) {
+        const source = value && typeof value === 'object' ? value : {};
+        const confidence = ['high', 'medium', 'low'].includes(String(source.confidence).toLowerCase())
+            ? String(source.confidence).toLowerCase()
+            : 'low';
+        const prices = Array.isArray(source.prices) ? source.prices.slice(0, 30).map(item => {
+            const row = item && typeof item === 'object' ? item : {};
+            const amount = Number(row.amount);
+            const currency = normalizeCurrencyCode(row.currency);
+            const amountCny = Number.isFinite(amount) ? convertToCny(amount, currency, rates) : NaN;
+            return {
+                plan: String(row.plan || '未标注套餐').trim().slice(0, 120),
+                amount: Number.isFinite(amount) ? amount : null,
+                currency,
+                billingPeriod: String(row.billingPeriod || 'unknown').trim().slice(0, 30),
+                amountCny: Number.isFinite(amountCny) ? amountCny : null,
+                evidence: String(row.evidence || '').trim().slice(0, 300)
+            };
+        }).filter(item => item.amount !== null) : [];
+        const quotas = Array.isArray(source.quotas) ? source.quotas.slice(0, 30).map(item => {
+            const row = item && typeof item === 'object' ? item : {};
+            const numericValue = Number(row.value);
+            return {
+                plan: String(row.plan || '未标注套餐').trim().slice(0, 120),
+                value: Number.isFinite(numericValue) ? numericValue : String(row.value || '').trim().slice(0, 80),
+                unit: String(row.unit || 'unknown').trim().slice(0, 30),
+                window: String(row.window || 'unknown').trim().slice(0, 30),
+                evidence: String(row.evidence || '').trim().slice(0, 300)
+            };
+        }) : [];
+        return {
+            confidence,
+            needsReview: source.needsReview !== false,
+            changeSummary: String(source.changeSummary || '').trim().slice(0, 500),
+            pageCurrency: normalizeCurrencyCode(source.pageCurrency),
+            prices,
+            quotas,
+            models: Array.isArray(source.models) ? source.models.map(v => String(v).trim()).filter(Boolean).slice(0, 40) : [],
+            warnings: Array.isArray(source.warnings) ? source.warnings.map(v => String(v).trim()).filter(Boolean).slice(0, 20) : []
+        };
+    }
+
+    function requestAiExtraction(url, sourceResult, reason) {
+        const settings = readAppSettings();
+        const ai = settings.ai || {};
+        if (!ai.enabled || !String(ai.apiKey || '').trim()) {
+            return Promise.resolve({ ok: false, skipped: true, error: 'AI 抽取未启用或未填写 API Key' });
+        }
+        const text = String(sourceResult.aiExcerpt || buildAiExcerpt(sourceResult.snapshotText || sourceResult.preview || ''))
+            .slice(0, Math.max(3000, Math.min(MAX_AI_EXCERPT_CHARS, Number(ai.maxExcerptChars) || 14000)));
+        if (text.length < 120) return Promise.resolve({ ok: false, skipped: true, error: '可供 AI 分析的正文过短' });
+        const fx = parseFxRates(settings.currency.rates);
+        const prompt = [
+            '你是订阅与价格页面的数据审计器。请从下面的官方页面正文中抽取结构化数据。',
+            '只允许依据正文明确出现的信息，不要猜测隐藏价格、Token容量、地区或套餐额度。',
+            '金额必须保留页面原始币种；如果页面没有明确币种，返回 UNKNOWN，不要根据访问者IP猜币种。',
+            '同时根据给定汇率计算 amountCny；汇率仅用于换算，不改变原始金额。',
+            '页面正文可能包含导航、营销文案、重复内容；请优先使用套餐表、价格表、额度表。',
+            '必须只返回 JSON，不要 Markdown 代码围栏。JSON 字段：',
+            JSON.stringify({
+                confidence: 'high|medium|low',
+                needsReview: true,
+                changeSummary: '本次页面变化的简短说明',
+                pageCurrency: 'USD|EUR|GBP|JPY|CNY|HKD|KRW|UNKNOWN',
+                prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', amountCny: 0, evidence: '原文短证据' }],
+                quotas: [{ plan: '套餐名', value: 0, unit: 'requests|tokens|credits|unknown', window: '5h|weekly|monthly|unknown', evidence: '原文短证据' }],
+                models: ['正文明确提及的模型'],
+                warnings: ['币种、地区、登录态或页面不确定性']
+            }),
+            '当前显示币种设置：' + (settings.currency.display || 'CNY'),
+            '汇率（1 外币 = 多少 CNY）：' + JSON.stringify(fx),
+            '触发原因：' + reason,
+            '来源 URL：' + url,
+            '页面标题：' + (sourceResult.title || ''),
+            '页面正文：',
+            text
+        ].join('\n');
+        return new Promise(resolve => {
+            const endpoint = String(ai.endpoint || '').trim();
+            if (!isHttpUrl(endpoint)) {
+                resolve({ ok: false, error: 'AI Endpoint 不是有效 HTTP(S) 地址' });
+                return;
+            }
+            const headers = { 'Content-Type': 'application/json' };
+            if (String(ai.apiKey).trim()) headers.Authorization = 'Bearer ' + String(ai.apiKey).trim();
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: endpoint,
+                timeout: 30000,
+                anonymous: true,
+                headers,
+                data: JSON.stringify({
+                    model: String(ai.model || 'gpt-4o-mini'),
+                    temperature: 0,
+                    max_tokens: 1800,
+                    messages: [
+                        { role: 'system', content: '你只输出严格 JSON。' },
+                        { role: 'user', content: prompt }
+                    ]
+                }),
+                onload: response => {
+                    if (Number(response.status) < 200 || Number(response.status) >= 300) {
+                        resolve({ ok: false, error: 'AI HTTP ' + response.status });
+                        return;
+                    }
+                    try {
+                        const payload = JSON.parse(response.responseText || '{}');
+                        const choices = payload.choices || [];
+                        const rawContent = (choices[0] && choices[0].message && choices[0].message.content)
+                            || payload.output_text
+                            || '';
+                        const content = Array.isArray(rawContent)
+                            ? rawContent.map(part => typeof part === 'string' ? part : (part?.text || '')).join('')
+                            : rawContent;
+                        const parsed = parseJsonFromModelText(content);
+                        if (!parsed || typeof parsed !== 'object') {
+                            resolve({ ok: false, error: 'AI 返回不是有效 JSON' });
+                            return;
+                        }
+                        const normalized = normalizeAiExtraction(parsed, fx);
+                        resolve({
+                            ok: true,
+                            status: Number(response.status),
+                            model: ai.model,
+                            checkedAt: new Date().toISOString(),
+                            needsReview: normalized.needsReview,
+                            data: normalized
+                        });
+                    } catch {
+                        resolve({ ok: false, error: 'AI 返回解析失败' });
+                    }
+                },
+                onerror: () => resolve({ ok: false, error: 'AI 网络请求失败' }),
+                ontimeout: () => resolve({ ok: false, error: 'AI 请求超时（30秒）' })
+            });
+        });
+    }
+
+    async function maybeRunAiExtraction(url, result, previous, forceAi = false) {
+        const settings = readAppSettings();
+        if (!settings.ai.enabled) {
+            if (forceAi) result.aiStatus = '未执行：请先在“厂商配置”中启用 AI';
+            return result;
+        }
+        const shouldRun = forceAi
+            || Boolean(result.changed)
+            || Boolean(result.weak)
+            || Boolean(settings.ai.runOnFirstCheck && !previous);
+        if (!shouldRun) return result;
+        const reason = forceAi
+            ? '用户手动要求 AI 复核'
+            : (result.changed ? '页面正文指纹发生变化' : '首次检查或确定性抽取置信度不足');
+        const aiResult = await requestAiExtraction(url, result, reason);
+        if (aiResult.ok) {
+            result.aiExtraction = aiResult.data;
+            result.aiStatus = '待人工确认';
+            result.aiCheckedAt = aiResult.checkedAt;
+            result.aiModel = aiResult.model;
+            GM_setValue(aiSnapshotKey(url), {
+                sourceUrl: url,
+                fingerprint: result.fingerprint || '',
+                status: '待人工确认',
+                checkedAt: aiResult.checkedAt,
+                model: aiResult.model,
+                excerpt: result.aiExcerpt || '',
+                rates: parseFxRates(settings.currency.rates),
+                data: aiResult.data
+            });
+        } else if (aiResult.skipped) {
+            result.aiStatus = 'AI未执行：' + aiResult.error;
+        } else {
+            result.aiStatus = 'AI失败：' + aiResult.error;
+        }
+        return result;
+    }
+
     function normalizeProbeText(text) {
         return String(text || '')
             .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -397,7 +851,7 @@
                 return {
                     mode: 'rendered',
                     extractorId: 'volcengine-doc',
-                    selectors: ['div[class*="contentdoc-"]', 'div[class*="content-CK"]', 'main', 'article'],
+                    selectors: ['div[class*="contentdoc-"]', 'div[class*="content-CK"]', '[class*="markdown"]', 'main', 'article', '#app', 'body'],
                     minLength: 120,
                     markers: []
                 };
@@ -406,7 +860,7 @@
                 return {
                     mode: 'rendered',
                     extractorId: 'zhipu-coding-plan',
-                    selectors: ['main', 'article', '[class*="markdown"]', 'body'],
+                    selectors: ['main', 'article', '[class*="markdown"]', '[class*="content"]', '#app', 'body'],
                     minLength: 200,
                     markers: []
                 };
@@ -415,7 +869,7 @@
                 return {
                     mode: 'rendered',
                     extractorId: 'kimi-code-pricing',
-                    selectors: ['.kfc-pricing-content', 'main', 'body'],
+                    selectors: ['.kfc-pricing-content', '[class*="pricing"]', '[class*="code"]', 'main', 'body'],
                     minLength: 120,
                     markers: []
                 };
@@ -424,7 +878,7 @@
                 return {
                     mode: 'rendered',
                     extractorId: 'grok-plans',
-                    selectors: ['main', 'body'],
+                    selectors: ['main', '[class*="plan"]', '[class*="pricing"]', 'body'],
                     minLength: 180,
                     markers: []
                 };
@@ -433,6 +887,14 @@
             return { mode: 'normal' };
         }
         return { mode: 'normal' };
+    }
+
+    function looksLikeDynamicShell(raw, body) {
+        const html = String(raw || '');
+        const visible = String(body || '');
+        const shellSignal = /<script[^>]+src=|id=["'](?:app|root|__next)["']|__NEXT_DATA__|enable javascript|javascript is required|正在加载|loading\.\.\./i.test(html);
+        const usefulSignal = /价格|定价|套餐|额度|限额|积分|token|quota|monthly|yearly|model|plan|price|订阅|更新|发布/i.test(visible);
+        return visible.length < 1200 && shellSignal && !usefulSignal;
     }
 
     function requestUpdateCheck(url, previous, requestOptions = {}) {
@@ -462,6 +924,12 @@
                             fingerprint: previous?.fingerprint || '',
                             etag: previous?.etag || '', lastModified: previous?.lastModified || '',
                             title: previous?.title || '', bytes: 0, textLength: previous?.textLength || 0,
+                            snapshotText: previous?.snapshotText || '',
+                            aiExcerpt: previous?.aiExcerpt || '',
+                            preview: previous?.preview || '',
+                            extractFacts: previous?.extractFacts || null,
+                            aiExtraction: previous?.aiExtraction || null,
+                            aiStatus: previous?.aiStatus || '',
                             checkedAt: new Date().toISOString(), changed: false, notModified: true, error: ''
                         });
                         return;
@@ -474,6 +942,10 @@
                         lastModified: getHeader(res.responseHeaders, 'last-modified'),
                         title: title.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
                         bytes: raw.length, textLength: body.length,
+                        snapshotText: body,
+                        preview: body.slice(0, 500),
+                        extractFacts: extractDeterministicFacts(body, url),
+                        weak: body.length < 180 || looksLikeDynamicShell(raw, body),
                         checkedAt: new Date().toISOString(),
                         error: status >= 200 && status < 400 ? '' : `HTTP ${status}`
                     });
@@ -482,6 +954,27 @@
                 ontimeout: () => resolve({ ok: false, status: 0, error: '请求超时（12秒）' })
             });
         });
+    }
+
+    function extractEmbeddedRenderedText() {
+        const pieces = [];
+        try {
+            document.querySelectorAll('meta[name="description"], meta[property="og:description"]').forEach(node => {
+                const content = String(node.getAttribute('content') || '').trim();
+                if (content) pieces.push(content);
+            });
+            document.querySelectorAll('script#__NEXT_DATA__, script[type="application/ld+json"], script[type="application/json"]').forEach(node => {
+                const raw = String(node.textContent || '').trim();
+                if (!raw) return;
+                try {
+                    const parsed = JSON.parse(raw);
+                    pieces.push(JSON.stringify(parsed));
+                } catch {
+                    pieces.push(raw.slice(0, 100000));
+                }
+            });
+        } catch {}
+        return sanitizeProbeText(pieces.join('\n')).slice(0, MAX_PROBE_BYTES);
     }
 
     function extractRenderedText(rule) {
@@ -495,8 +988,19 @@
                 });
             } catch {}
         });
+        try {
+            document.querySelectorAll('iframe').forEach(frame => {
+                try {
+                    const frameDoc = frame.contentDocument;
+                    if (!frameDoc) return;
+                    const frameText = String(frameDoc.body?.innerText || frameDoc.body?.textContent || '').trim();
+                    if (frameText) candidates.push(frameText);
+                } catch {}
+            });
+        } catch {}
         const longest = candidates.sort((a, b) => b.length - a.length)[0] || '';
-        return sanitizeProbeText(longest).slice(0, MAX_PROBE_BYTES);
+        const embedded = extractEmbeddedRenderedText();
+        return sanitizeProbeText([longest, embedded].filter(Boolean).join('\n')).slice(0, MAX_PROBE_BYTES);
     }
 
     function captureRenderedSourceIfRequested() {
@@ -517,7 +1021,9 @@
             lastText = text;
             const blocked = /access denied|forbidden|just a moment|enable cookies|verify you are human|captcha|安全验证|人机验证/i.test(text);
             const enough = text.length >= minLength && !blocked;
-            const timedOut = Date.now() - startedAt > 22000;
+            const timedOut = Date.now() - startedAt > 30000;
+            const pageAccessible = document.readyState !== 'loading' && !blocked;
+            const ok = enough || (timedOut && pageAccessible);
 
             if ((!enough || stableRounds < 2) && !timedOut) {
                 setTimeout(collect, 500);
@@ -525,12 +1031,17 @@
             }
             GM_setValue(reqKey, {
                 state: 'done',
-                ok: enough,
-                error: enough ? '' : (blocked ? '命中安全验证' : '有效正文不足 ' + minLength + ' 字'),
+                ok,
+                weak: !enough,
+                uncomparable: Boolean(ok && !enough),
+                error: enough ? '' : (blocked ? '命中安全验证' : (pageAccessible ? '页面可访问；动态渲染，未取得可比较正文' : '有效正文不足 ' + minLength + ' 字')),
                 checkedAt: new Date().toISOString(),
                 title: document.title,
                 textLength: text.length,
-                fingerprint: text ? hashText(text) : ''
+                fingerprint: text ? hashText(text) : '',
+                snapshotText: text,
+                preview: text.slice(0, 500),
+                extractFacts: extractDeterministicFacts(text, location.href)
             });
             setTimeout(() => window.close(), 300);
         };
@@ -571,15 +1082,16 @@
                     resolve({
                         ...res,
                         rendered: true,
-                        weak: !res.ok,
+                        weak: res.weak !== undefined ? Boolean(res.weak) : !res.ok,
+                        uncomparable: Boolean(res.uncomparable),
                         changed: Boolean(res.ok && previous?.fingerprint && previous.fingerprint !== res.fingerprint),
                         previousCheckedAt: previous?.checkedAt || ''
                     });
                     return;
                 }
-                if (Date.now() - startedAt > 26000) {
+                if (Date.now() - startedAt > 36000) {
                     if (tab && typeof tab.close === 'function') tab.close();
-                    resolve({ ok: false, rendered: true, error: '采集超时（26秒）' });
+                    resolve({ ok: false, rendered: true, error: '采集超时（36秒）' });
                     return;
                 }
                 setTimeout(poll, 500);
@@ -601,18 +1113,69 @@
             if (fallbackRes.ok) result = fallbackRes;
         }
 
-        result.probeMode = rule.mode;
-        if (result.ok) {
-            result.changed = Boolean(previous?.fingerprint && previous.fingerprint !== result.fingerprint);
+        result.probeMode = result.rendered ? 'rendered' : rule.mode;
+        if (result.snapshotText) {
+            result.snapshotText = sanitizeProbeText(result.snapshotText).slice(0, MAX_PROBE_BYTES);
+            result.aiExcerpt = buildAiExcerpt(result.snapshotText);
+        }
+        if (!result.extractFacts && result.snapshotText) result.extractFacts = extractDeterministicFacts(result.snapshotText, url);
+        result.changed = Boolean(!result.weak && previous?.fingerprint && previous.fingerprint !== result.fingerprint);
+        result.sourceUrl = url;
+        result.compareAvailable = Boolean(!result.weak && previous?.fingerprint && result.fingerprint);
+        if (!result.aiExtraction && previous && !result.changed) {
+            result.aiExtraction = previous.aiExtraction || null;
+            result.aiStatus = previous.aiStatus || '';
+            result.aiCheckedAt = previous.aiCheckedAt || '';
+            result.aiModel = previous.aiModel || '';
+        }
+        result = await maybeRunAiExtraction(url, result, previous, Boolean(requestOptions.forceAi));
+        if (result.ok && (!result.weak || !previous)) {
             result.previousCheckedAt = previous?.checkedAt || '';
             GM_setValue(sourceKey(url), result);
             return result;
         }
+        if (result.ok && result.weak && previous) {
+            const retained = { ...previous };
+            retained.lastError = result.error || '本次正文不足，保留上次可比较记录';
+            retained.lastAttemptAt = new Date().toISOString();
+            retained.aiStatus = result.aiStatus || retained.aiStatus || '';
+            retained.aiExtraction = result.aiExtraction || retained.aiExtraction || null;
+            retained.aiCheckedAt = result.aiCheckedAt || retained.aiCheckedAt || '';
+            retained.aiModel = result.aiModel || retained.aiModel || '';
+            retained.currentProbe = {
+                ok: result.ok,
+                weak: true,
+                uncomparable: Boolean(result.uncomparable),
+                error: result.error || '',
+                aiStatus: result.aiStatus || '',
+                aiExtraction: result.aiExtraction || null,
+                checkedAt: result.checkedAt || ''
+            };
+            GM_setValue(sourceKey(url), retained);
+            return {
+                ...retained,
+                attemptFailed: true,
+                attemptError: retained.lastError,
+                uncomparable: Boolean(result.uncomparable),
+                aiStatus: result.aiStatus || retained.aiStatus || '',
+                aiExtraction: result.aiExtraction || retained.aiExtraction || null,
+                currentProbe: retained.currentProbe
+            };
+        }
         const retained = previous ? { ...previous } : {};
         retained.lastError = result.error || '检查失败';
         retained.lastAttemptAt = new Date().toISOString();
+        retained.aiStatus = result.aiStatus || retained.aiStatus || '';
+        retained.aiExtraction = result.aiExtraction || retained.aiExtraction || null;
+        retained.aiCheckedAt = result.aiCheckedAt || retained.aiCheckedAt || '';
+        retained.aiModel = result.aiModel || retained.aiModel || '';
         GM_setValue(sourceKey(url), retained);
-        return { ...retained, attemptFailed: true, attemptError: retained.lastError };
+        return {
+            ...retained,
+            ...(previous ? {} : { ok: false, error: retained.lastError }),
+            attemptFailed: true,
+            attemptError: retained.lastError
+        };
     }
 
     function probeSummary(probe) {
@@ -620,11 +1183,144 @@
             return { label: `本次失败：${probe.attemptError}；保留 ${formatDate(probe.checkedAt)} 记录`, color: '#e3b341' };
         }
         if (!probe) return { label: '未检查', color: '#8b949e' };
-        if (!probe.ok) return { label: `失败：${probe.error || '未知错误'}`, color: '#f85149' };
+        if (!probe.ok) return { label: '失败：' + (probe.error || '未知错误'), color: '#f85149' };
+        if (probe.uncomparable) return { label: probe.error || '页面可访问；动态渲染，未取得可比较正文', color: '#e3b341' };
         if (probe.changed) return { label: `页面发生更新（${formatDate(probe.checkedAt)}）`, color: '#e3b341' };
         if (probe.weak) return { label: `内容过短（${formatDate(probe.checkedAt)}）`, color: '#e3b341' };
         const len = Number(probe.textLength || probe.bytes || 0).toLocaleString();
-        return { label: `正常 · ${len} 字（${formatDate(probe.checkedAt)}）`, color: '#3fb950' };
+        const facts = probe.extractFacts && probe.extractFacts.signals && probe.extractFacts.signals.length
+            ? '；' + probe.extractFacts.signals.join('，')
+            : '';
+        const ai = probe.aiStatus ? '；' + probe.aiStatus : '';
+        const rendered = probe.rendered
+            ? (probe.compareAvailable ? '动态渲染，已比较正文' : '动态渲染，已保存正文；首次无历史可比')
+            : '静态正文';
+        return { label: rendered + ' · ' + len + ' 字' + facts + ai + '（' + formatDate(probe.checkedAt) + '）', color: probe.aiStatus ? '#e3b341' : '#3fb950' };
+    }
+
+    function formatAiSnapshot(snapshot) {
+        if (!snapshot || !snapshot.data) return '';
+        const data = snapshot.data;
+        const prices = Array.isArray(data.prices) ? data.prices.slice(0, 4).map(item => {
+            const amount = Number(item.amount);
+            const currency = normalizeCurrencyCode(item.currency);
+            const raw = Number.isFinite(amount) ? currencySymbol(currency) + amount : currency;
+            const cny = Number(item.amountCny);
+            return item.plan ? item.plan + ' ' + raw + (Number.isFinite(cny) && currency !== 'CNY' ? '≈¥' + cny.toFixed(0) : '') : raw;
+        }) : [];
+        const changes = String(data.changeSummary || '').trim();
+        const quotas = Array.isArray(data.quotas) ? data.quotas.slice(0, 3).map(item => {
+            const value = item.value === undefined || item.value === null ? '' : item.value;
+            return item.plan + ' ' + value + ' ' + (item.unit || '') + '/' + (item.window || '');
+        }) : [];
+        const warnings = Array.isArray(data.warnings) ? data.warnings.slice(0, 2).join('、') : '';
+        const pieces = [];
+        if (prices.length) pieces.push('价格 ' + prices.join('、'));
+        if (quotas.length) pieces.push('额度 ' + quotas.join('、'));
+        if (changes) pieces.push(changes);
+        if (data.pageCurrency) pieces.push('页面币种 ' + normalizeCurrencyCode(data.pageCurrency));
+        if (data.confidence) pieces.push('置信度 ' + data.confidence);
+        if (warnings) pieces.push('注意 ' + warnings);
+        return pieces.join('；') || '已取得结构化结果，待人工确认';
+    }
+
+    function getProviderAiSnapshot(provider) {
+        const links = [...getUsableLinks(provider, 'pricing'), ...getUsableLinks(provider, 'updates')];
+        const snapshots = links.map(link => GM_getValue(aiSnapshotKey(link.url), null)).filter(Boolean);
+        snapshots.sort((a, b) => String(b.checkedAt || '').localeCompare(String(a.checkedAt || '')));
+        return snapshots[0] || null;
+    }
+
+    function formatCny(value) {
+        const amount = Number(value);
+        return Number.isFinite(amount) ? '¥' + amount.toFixed(2) : '待补价';
+    }
+
+    function readCalcCart() {
+        const saved = GM_getValue(CALC_CART_KEY, {});
+        const source = saved && typeof saved === 'object' ? saved : {};
+        return {
+            targetB: Number.isFinite(Number(source.targetB)) && Number(source.targetB) > 0 ? Number(source.targetB) : 20,
+            nightPercent: Number.isFinite(Number(source.nightPercent)) ? Math.min(100, Math.max(0, Number(source.nightPercent))) : 40,
+            apiMode: String(source.apiMode || API_COST_PROFILES[0].id),
+            customApiCost: Number.isFinite(Number(source.customApiCost)) ? Math.max(0, Number(source.customApiCost)) : 0,
+            quantities: source.quantities && typeof source.quantities === 'object' ? source.quantities : {},
+            overrides: source.overrides && typeof source.overrides === 'object' ? source.overrides : {}
+        };
+    }
+
+    function saveCalcCart(cart) {
+        GM_setValue(CALC_CART_KEY, {
+            targetB: Number(cart.targetB) > 0 ? Number(cart.targetB) : 20,
+            nightPercent: Math.min(100, Math.max(0, Number(cart.nightPercent) || 0)),
+            apiMode: String(cart.apiMode || API_COST_PROFILES[0].id),
+            customApiCost: Math.max(0, Number(cart.customApiCost) || 0),
+            quantities: cart.quantities && typeof cart.quantities === 'object' ? cart.quantities : {},
+            overrides: cart.overrides && typeof cart.overrides === 'object' ? cart.overrides : {}
+        });
+    }
+
+    function getCartRows() {
+        const enabledIds = new Set(getEnabledProviders().map(provider => provider.id));
+        return CART_ACCOUNT_ROWS.filter(row => enabledIds.has(row.providerId));
+    }
+
+    function getAccountPrice(row, override, rates) {
+        const hasOverride = override && override.price !== '' && Number.isFinite(Number(override.price));
+        const baseAmount = row.price === null || row.price === undefined || row.price === '' ? NaN : Number(row.price);
+        const amount = hasOverride ? Number(override.price) : baseAmount;
+        const currency = normalizeCurrencyCode(override?.currency || row.currency);
+        return {
+            amount: Number.isFinite(amount) && amount >= 0 ? amount : NaN,
+            currency,
+            cny: convertToCny(amount, currency, rates)
+        };
+    }
+
+    function getAccountCapacity(row, override) {
+        const hasOverride = override && override.capacityB !== '' && Number.isFinite(Number(override.capacityB));
+        const baseCapacity = row.capacityB === null || row.capacityB === undefined || row.capacityB === '' ? NaN : Number(row.capacityB);
+        const candidate = hasOverride ? Number(override.capacityB) : baseCapacity;
+        return Number.isFinite(candidate) && candidate >= 0 ? candidate : NaN;
+    }
+
+    function calculateApiCostPerB(mode, nightPercent, customCost) {
+        if (mode === 'custom') return Math.max(0, Number(customCost) || 0);
+        const profile = API_COST_PROFILES.find(item => item.id === mode) || API_COST_PROFILES[0];
+        const nightDiscount = 1 - Math.min(100, Math.max(0, Number(nightPercent) || 0)) / 100 * 0.5;
+        const cacheHitShare = Math.min(1, Math.max(0, Number(profile.cacheHitShare ?? 0.8)));
+        const inputCostPerM = Number(profile.inputCache || 0) * cacheHitShare + Number(profile.inputMiss || 0) * (1 - cacheHitShare);
+        const outputCostPerM = Number(profile.output || 0) * Number(profile.outputShare || 0.1);
+        return Math.max(0, (inputCostPerM + outputCostPerM) * nightDiscount * 1000);
+    }
+
+    function formatProbeDetails(probe, url) {
+        if (!probe) return '<div class="llm-muted" data-source-details>尚未取得正文。点击“检查”开始。</div>';
+        const facts = probe.extractFacts || {};
+        const priceFacts = Array.isArray(facts.prices) ? facts.prices.slice(0, 5).map(item => {
+            const cny = Number(item.amountCny);
+            const displayAmount = Number(item.amountDisplay);
+            const displayCode = normalizeCurrencyCode(facts.displayCurrency || 'CNY');
+            return escapeHtml(item.raw || (currencySymbol(item.currency) + item.amount))
+                + (Number.isFinite(displayAmount) ? '≈' + escapeHtml(currencySymbol(displayCode) + displayAmount.toFixed(2)) : (Number.isFinite(cny) ? '≈' + escapeHtml(formatCny(cny)) : '（未换算）'));
+        }).join('、') : '';
+        const ai = probe.aiExtraction
+            ? 'AI：' + escapeHtml(formatAiSnapshot({ data: probe.aiExtraction }))
+            : (probe.aiStatus ? 'AI：' + escapeHtml(probe.aiStatus) : 'AI：未复核');
+        const aiEvidence = probe.aiExtraction && Array.isArray(probe.aiExtraction.prices)
+            ? probe.aiExtraction.prices.slice(0, 3).map(item => String(item.plan || '未标注套餐') + '：“' + String(item.evidence || '无原文证据') + '”').join('；')
+            : '';
+        const factsText = [
+            facts.confidence ? '确定性抽取 ' + facts.confidence : '',
+            facts.inferredCurrency && facts.inferredCurrency !== 'UNKNOWN' ? '页面推断币种 ' + facts.inferredCurrency : '页面币种未明确',
+            priceFacts ? '价格 ' + priceFacts : ''
+        ].filter(Boolean).join('；');
+        const rendered = probe.uncomparable
+            ? '页面可访问，但未取得可比较正文'
+            : (probe.rendered ? '动态渲染正文已保存' : 'HTTP 正文已保存');
+        return '<div class="llm-muted" data-source-details>' + escapeHtml(rendered) + '；' + escapeHtml(factsText || '暂未识别结构化价格') + '；' + ai
+            + (aiEvidence ? '<br>AI原文证据：' + escapeHtml(aiEvidence) : '')
+            + '<br><span style="word-break:break-all;">证据来源：' + escapeHtml(url || probe.sourceUrl || '') + '</span></div>';
     }
 
     captureRenderedSourceIfRequested();
@@ -748,6 +1444,15 @@
             background: rgba(0,0,0,0.35); border: 1px solid var(--llm-border); color: #fff; border-radius: 6px;
             padding: 7px 9px; font: 12px/1.5 ui-monospace, monospace;
         }
+        #llm-modal .llm-settings-row input[type="text"],
+        #llm-modal .llm-settings-row input[type="password"],
+        #llm-modal .llm-settings-row input[type="number"],
+        #llm-modal .llm-settings-row select {
+            max-width: 100%; background: rgba(0,0,0,0.35); border: 1px solid var(--llm-border);
+            color: #fff; border-radius: 6px; padding: 6px 8px; font-size: 12px;
+        }
+        #llm-modal .llm-settings-row input[type="text"],
+        #llm-modal .llm-settings-row input[type="password"] { width: 100%; }
         #llm-modal .llm-settings-label { display: block; margin-top: 8px; color: var(--llm-text-dim); font-size: 11px; }
         #llm-modal .llm-source-status { font-size: 11px; margin-top: 5px; line-height: 1.4; }
         #llm-modal .llm-muted { color: var(--llm-text-dim); font-size: 11px; line-height: 1.5; }
@@ -815,6 +1520,7 @@
             const pricingLinks = getUsableLinks(p, 'pricing');
             const updateLinks = getUsableLinks(p, 'updates');
             const kw = [p.name, p.models, p.category, p.tag, p.plans, p.promos, p.traps].join(' ');
+            const aiSnapshot = getProviderAiSnapshot(p);
             html += `
                 <div class="llm-card" data-kw="${escapeHtml(kw)}">
                     <div class="llm-card-header">
@@ -832,6 +1538,7 @@
                     <div class="llm-highlight-promo">🎁 <strong>活动优惠：</strong>${escapeHtml(p.promos)}</div>
                     <div style="font-size: 11px; color: var(--llm-red); margin-bottom: 6px;">⚠️ <strong>避坑提示：</strong>${escapeHtml(p.traps)}</div>
                     <div class="llm-muted">官方数据核验：${escapeHtml(p.verifiedAt)}</div>
+                    ${aiSnapshot ? '<div class="llm-highlight-promo">🤖 最近 AI 待人工确认：' + escapeHtml(formatAiSnapshot(aiSnapshot)) + '</div>' : ''}
                     <div class="llm-card-links">
                         ${pricingLinks.map(l => `<a href="${safeHref(l.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip">💳 ${escapeHtml(l.title)}</a>`).join('')}
                         ${updateLinks.map(l => `<a href="${safeHref(l.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip" style="background: rgba(35,134,54,0.18); color: #3fb950;">📢 ${escapeHtml(l.title)}</a>`).join('')}
@@ -855,17 +1562,26 @@
         const providers = getEnabledProviders();
         let html = `
             <div style="display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;">
-                <button class="llm-btn" id="llm-probe-all" title="依次联网检查全部启用的来源">检查全部来源</button>
-                <button class="llm-btn" id="llm-probe-pricing" title="仅检查套餐和价格来源">仅检查定价</button>
-                <button class="llm-btn" id="llm-radar-refresh" title="重新加载本地缓存状态">重新读取本地状态</button>
+                <button class="llm-btn" id="llm-probe-all" title="依次联网检查全部启用的定价与更新来源">① 检查全部来源</button>
+                <button class="llm-btn" id="llm-probe-pricing" title="只联网检查定价/套餐来源，不检查更新公告">② 仅检查定价</button>
+                <button class="llm-btn" id="llm-radar-refresh" title="只重新渲染本地已保存状态，不发起网络请求">③ 重新读取本地状态</button>
             </div>
-            <div class="llm-muted" style="margin-bottom: 10px;">后台页面串行提取。绿色=正常；黄色=检测到变更；红色=请求失败。</div>
+            <div class="llm-card" style="margin-bottom: 12px;">
+                <div style="font-size: 12px; line-height: 1.7;">
+                    <strong>雷达操作说明</strong><br>
+                    ① <strong>检查全部来源</strong>：逐个打开官方页面并采集正文；适合完整巡检，速度较慢。<br>
+                    ② <strong>仅检查定价</strong>：只检查价格/套餐链接；适合优先核对成本。<br>
+                    ③ <strong>重新读取本地状态</strong>：不联网，只把已保存的检查结果重新显示。每条来源的“检查”是普通采集，“AI复核”是在采集正文后送到你配置的模型进行结构化整理。<br>
+                    <span class="llm-muted">绿色表示已取得正文；黄色表示首次动态页面尚无历史可比、检测到变化或需要人工确认；红色表示本次请求失败。AI 结果只作证据辅助，不会自动覆盖厂商主数据。</span>
+                </div>
+            </div>
         `;
         providers.forEach(p => {
             [...getUsableLinks(p, 'pricing').map(l => ({ ...l, kind: 'pricing' })), ...getUsableLinks(p, 'updates').map(l => ({ ...l, kind: 'updates' }))].forEach(up => {
                 const key = `llm_view_${p.id}_${encodeURIComponent(up.title)}`;
                 const last = GM_getValue(key, '未读');
-                const summary = probeSummary(GM_getValue(sourceKey(up.url), null));
+                const lastProbe = GM_getValue(sourceKey(up.url), null);
+                const summary = probeSummary(lastProbe);
                 html += `
                     <div class="llm-settings-row" data-source-card="${escapeHtml(up.url)}">
                         <div style="display: flex; justify-content: space-between; gap: 10px; align-items: flex-start;">
@@ -875,10 +1591,12 @@
                                 <div class="llm-source-status" data-source-status style="color: ${summary.color};">来源检查：${escapeHtml(summary.label)}</div>
                             </div>
                             <div style="display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end;">
-                                <button class="llm-btn llm-probe-one" data-url="${safeHref(up.url)}" data-kind="${up.kind}">检查</button>
+                                <button class="llm-btn llm-probe-one" data-url="${safeHref(up.url)}" data-kind="${up.kind}" title="获取页面正文并比较历史指纹">检查</button>
+                                <button class="llm-btn llm-ai-one" data-url="${safeHref(up.url)}" data-kind="${up.kind}" title="重新获取正文并调用已配置的 AI 抽取">AI复核</button>
                                 <a href="${safeHref(up.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip track-read" data-key="${escapeHtml(key)}" style="font-size: 12px; padding: 5px 10px;">打开来源 ↗</a>
                             </div>
                         </div>
+                        ${formatProbeDetails(lastProbe, up.url)}
                     </div>
                 `;
             });
@@ -891,20 +1609,26 @@
             });
         });
 
-        const checkOne = async button => {
+        const checkOne = async (button, forceAi = false) => {
             const url = button.getAttribute('data-url');
             const card = button.closest('[data-source-card]');
             const status = card?.querySelector('[data-source-status]');
+            const details = card?.querySelector('[data-source-details]');
             button.disabled = true;
             if (status) { status.textContent = '来源检查：检查中…'; status.style.color = '#e3b341'; }
-            const result = await probeSource(url);
+            const result = await probeSource(url, { forceAi });
             const next = probeSummary(result);
-            if (status) { status.textContent = `来源检查：${next.label}`; status.style.color = next.color; }
+            if (status) { status.textContent = '来源检查：' + next.label; status.style.color = next.color; }
+            if (details) details.outerHTML = formatProbeDetails(result, url);
             button.disabled = false;
         };
 
         bodyContent.querySelectorAll('.llm-probe-one').forEach(btn => {
             btn.addEventListener('click', () => checkOne(btn));
+        });
+
+        bodyContent.querySelectorAll('.llm-ai-one').forEach(btn => {
+            btn.addEventListener('click', () => checkOne(btn, true));
         });
 
         const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -930,199 +1654,228 @@
         bodyContent.querySelector('#llm-radar-refresh').addEventListener('click', renderRadar);
     }
 
-    // ======================== 6. 月用量自适应测算引擎 (核心重构) ========================
+    // ======================== 6. 单账号极限基准 + 自选购物车大盘 ========================
     function renderCalc() {
-        bodyContent.innerHTML = `
-            <div class="llm-calc-box">
-                <div style="font-weight: 600; margin-bottom: 12px; font-size: 14px;">🧮 月度代码用量 · 真实支出成本测算</div>
-                <div class="llm-input-group">
-                    <span>你的预估月度总 Token 消耗：</span>
-                    <span><input type="number" id="calc-monthly-tokens-m" class="llm-input-num" value="200" min="1" max="100000" /> M Tokens</span>
-                </div>
-                <div class="llm-input-group">
-                    <span>夜间 / 闲时任务占比 (可直接输入 0~100)：</span>
-                    <span><input type="number" id="calc-night-ratio-input" class="llm-input-num" value="40" min="0" max="100" /> %</span>
-                </div>
-                <div class="llm-muted" style="margin-top:6px;">
-                    💡 算法说明：输入你真实的月度 Token 规模。若套餐配额足够，按套餐原价计费；若因周限额或 5h 窗口导致额度不足，算法自动按 <strong>[套餐费 + 缺口 Token × DeepSeek API 单价]</strong> 测算真实月花费，并提示短板。
-                </div>
-            </div>
-            <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">🏆 满足该用量的真实月支出排行（花费越低越合算）：</div>
-            <div id="llm-calc-results"></div>
-        `;
+        const settings = readAppSettings();
+        const rates = parseFxRates(settings.currency.rates);
+        const cart = readCalcCart();
+        const rows = getCartRows();
+        const providers = new Map(getAllProviders().map(provider => [provider.id, provider]));
+        const currencies = ['CNY', 'USD', 'EUR', 'GBP', 'JPY', 'HKD', 'KRW', 'SGD', 'CAD', 'AUD'];
+        const apiOptions = API_COST_PROFILES.map(profile => '<option value="' + escapeHtml(profile.id) + '"' + (cart.apiMode === profile.id ? ' selected' : '') + '>' + escapeHtml(profile.name) + '</option>').join('');
+        const formatDefaultPrice = row => {
+            const price = getAccountPrice(row, {}, rates);
+            if (!Number.isFinite(price.cny)) return '价格未知';
+            return escapeHtml(currencySymbol(price.currency) + Number(price.amount).toFixed(2) + ' ≈ ¥' + price.cny.toFixed(2));
+        };
+        const currencyOptions = current => currencies.map(code => '<option value="' + code + '"' + (normalizeCurrencyCode(current) === code ? ' selected' : '') + '>' + code + '</option>').join('');
+        const rowHtml = rows.map(row => {
+            const provider = providers.get(row.providerId) || { name: row.providerId };
+            const saved = cart.overrides[row.id] && typeof cart.overrides[row.id] === 'object' ? cart.overrides[row.id] : {};
+            const quantity = Math.floor(Math.max(0, Number(cart.quantities[row.id]) || 0));
+            const defaultCapacity = Number.isFinite(Number(row.capacityB)) ? Number(row.capacityB).toFixed(2) + 'B' : '未知，需手填';
+            const baselinePrice = getAccountPrice(row, {}, rates);
+            const unitCost = Number.isFinite(baselinePrice.cny) && Number(row.capacityB) > 0 ? '；约 ¥' + (baselinePrice.cny / Number(row.capacityB)).toFixed(2) + '/B' : '';
+            const modeLabel = row.capacityMode === 'official-credit' ? '官方 Credits（按 B 暂计，建议用实测覆盖）' : (row.capacityMode === 'official-token' ? '官方计量值' : '未公开 Token 容量');
+            return [
+                '<div class="llm-settings-row" data-cart-row="' + escapeHtml(row.id) + '">',
+                '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">',
+                '<label style="font-size:13px;font-weight:600;min-width:0;">',
+                '<input type="checkbox" data-cart-check ' + (quantity > 0 ? 'checked' : '') + ' /> ',
+                escapeHtml(provider.name) + ' · ' + escapeHtml(row.plan),
+                '<span class="llm-muted" style="margin-left:6px;">' + formatDefaultPrice(row) + '</span>',
+                '</label>',
+                '<span class="llm-muted" style="text-align:right;">单账号上限：' + escapeHtml(defaultCapacity + unitCost) + '</span>',
+                '</div>',
+                '<div class="llm-grid-details" style="margin-top:8px;">',
+                '<div><strong>价格覆盖：</strong><input class="llm-input-num" style="width:86px;" type="number" min="0" step="0.01" data-cart-price value="' + escapeHtml(saved.price === undefined ? '' : saved.price) + '" placeholder="' + (row.price === null ? '必填' : '默认') + '" /> ',
+                '<select data-cart-currency style="background:rgba(0,0,0,.35);border:1px solid var(--llm-border);color:#fff;padding:6px;border-radius:6px;">' + currencyOptions(saved.currency || row.currency) + '</select></div>',
+                '<div><strong>容量覆盖：</strong><input class="llm-input-num" style="width:86px;" type="number" min="0" step="0.01" data-cart-capacity value="' + escapeHtml(saved.capacityB === undefined ? '' : saved.capacityB) + '" placeholder="' + (Number.isFinite(Number(row.capacityB)) ? '默认' : '必填') + '" /> B Token/额度</div>',
+                '</div>',
+                '<div class="llm-muted">数量 <input class="llm-input-num" style="width:76px;" type="number" min="0" step="1" data-cart-quantity value="' + quantity + '" />；' + escapeHtml(modeLabel) + '；短板：' + escapeHtml(row.bottleneck) + '</div>',
+                '<div class="llm-muted" style="margin-top:3px;">证据口径：' + escapeHtml(row.evidence) + '</div>',
+                '</div>'
+            ].join('');
+        }).join('');
 
-        function recalculate() {
-            const targetM = Math.max(1, parseFloat(document.getElementById('calc-monthly-tokens-m').value) || 200);
-            const nightPercent = Math.min(100, Math.max(0, parseFloat(document.getElementById('calc-night-ratio-input').value) || 0));
-            const nightRatio = nightPercent / 100;
+        bodyContent.innerHTML = [
+            '<div class="llm-calc-box">',
+            '<div style="font-weight:600;margin-bottom:10px;font-size:14px;">🧮 单账号极限基准 + 自选购物车大盘</div>',
+            '<div class="llm-muted" style="line-height:1.7;">这里不替你自动挑套餐，也不假设一个账号能被算法分配给不同任务。你先看每个账号公开的单号上限，再勾选要实际购买的账号数量；系统只汇总你的选择。未知容量按 0 计入，必须填“容量覆盖”后才会进入大盘。</div>',
+            '<div class="llm-input-group" style="margin-top:12px;"><span>目标月用量：</span><span><input type="number" id="calc-target-b" class="llm-input-num" min="0.01" step="0.1" value="' + cart.targetB + '" /> B Token</span></div>',
+            '<div class="llm-input-group"><span>闲时/夜间占比：</span><span><input type="number" id="calc-night-percent" class="llm-input-num" min="0" max="100" step="1" value="' + cart.nightPercent + '" /> %</span></div>',
+            '<div class="llm-input-group"><span>API 兜底基准：</span><span><select id="calc-api-mode" style="background:rgba(0,0,0,.35);border:1px solid var(--llm-border);color:#fff;padding:6px;border-radius:6px;">' + apiOptions + '</select></span></div>',
+            '<div class="llm-input-group"><span>自定义 API 成本（仅选自定义时生效）：</span><span><input type="number" id="calc-custom-api-cost" class="llm-input-num" min="0" step="0.01" value="' + cart.customApiCost + '" /> ¥ / B Token</span></div>',
+            '<div class="llm-muted">API 兜底只用于“已知容量不足”的缺口估算，不会把未知订阅伪装成有容量。当前口径：输入缓存/未命中、输出占比分别由代码基准给出；如你的模型和输入输出比例不同，请选“自定义”覆盖。</div>',
+            '</div>',
+            '<div style="font-size:13px;font-weight:600;margin:8px 0;">① 单账号极限基准（可勾选，不自动排序或替你购买）</div>',
+            '<div id="llm-cart-list">' + (rowHtml || '<div class="llm-card">当前没有启用的厂商账号，请先到“厂商配置”启用。</div>') + '</div>',
+            '<div style="font-size:13px;font-weight:600;margin:14px 0 8px;">② 自选购物车大盘</div>',
+            '<div id="llm-calc-summary"></div>',
+            '<div style="margin-top:8px;"><button class="llm-btn" id="llm-clear-cart">清空购物车勾选与覆盖值</button></div>'
+        ].join('');
 
-            // 统一 API 兜底基准（按 DeepSeek V4.1 Flash 混合算力折合单价：输入缓存0.04，未命中2.0，输出4.0，闲时半价）
-            const dsUnitPricePerM = (0.04 * 0.8 + 2.0 * 0.2 + 4.0 * 0.1) * (1 - nightRatio * 0.5);
-
-            // 各家套餐全月安全容量推导（单位：M Tokens）
-            const plans = [
-                {
-                    name: 'DeepSeek 原生 API',
-                    tier: '按量实时计费',
-                    basePrice: 0,
-                    maxCapacityM: 9999999, // 无上限
-                    bottleneck: '随用随扣，无月度闲置浪费',
-                    calcCost: (m) => m * dsUnitPricePerM
-                },
-                {
-                    name: '火山方舟 (Coding Plan)',
-                    tier: targetM <= 450 ? 'Lite 档位 (¥40/月)' : 'Pro 档位 (¥200/月)',
-                    basePrice: targetM <= 450 ? 40 : 200,
-                    // Lite 每月 18,000 次，按平均每次交互 25k Tokens 折合约 450M；Pro 9万次折约 2,250M
-                    maxCapacityM: targetM <= 450 ? 450 : 2250,
-                    bottleneck: targetM <= 450 ? '每月 18,000 次调用上限' : '每月 90,000 次调用上限'
-                },
-                {
-                    name: '百度千帆 (Coding Plan)',
-                    tier: targetM <= 450 ? 'Lite 档位 (¥40/月)' : 'Pro 档位 (¥200/月)',
-                    basePrice: targetM <= 450 ? 40 : 200,
-                    maxCapacityM: targetM <= 450 ? 450 : 2250,
-                    bottleneck: targetM <= 450 ? '每月 18,000 次硬限额' : '每月 90,000 次硬限额'
-                },
-                {
-                    name: '阿里百炼 (Token Plan)',
-                    tier: targetM <= 180 ? 'Lite 档位 (¥39/月)' : (targetM <= 700 ? 'Standard 档位 (¥139/月)' : 'Pro 档位 (¥499/月)'),
-                    basePrice: targetM <= 180 ? 39 : (targetM <= 700 ? 139 : 499),
-                    // 每周 Credits，夜间享超低 2 折抵扣
-                    maxCapacityM: (targetM <= 180 ? 180 : (targetM <= 700 ? 700 : 2800)) * (1 + nightRatio * 1.2),
-                    bottleneck: '每 7 天 Credits 硬顶与 5h 滑动节流'
-                },
-                {
-                    name: '小米 MiMo (Token Plan)',
-                    tier: targetM <= 800 ? 'Lite 档位 (¥39/月)' : (targetM <= 2200 ? 'Standard 档位 (¥99/月)' : 'Pro 档位 (¥329/月)'),
-                    basePrice: targetM <= 800 ? 39 : (targetM <= 2200 ? 99 : 329),
-                    // 4.1B / 11B Credits, 夜间0.8倍
-                    maxCapacityM: (targetM <= 800 ? 800 : (targetM <= 2200 ? 2200 : 7600)) * (1 + nightRatio * 0.25),
-                    bottleneck: '月度固定 Credits 算力包总量'
-                },
-                {
-                    name: 'GitHub Copilot Pro',
-                    tier: 'Pro ($10/月 约¥72)',
-                    basePrice: 72,
-                    maxCapacityM: 300, // 补全无限，Agent 模式折合基础额度
-                    bottleneck: '高级 Agent 模式依赖每月赠送额度'
-                },
-                {
-                    name: '智谱 AI (Coding Plan)',
-                    tier: targetM <= 350 ? 'Lite 档位 (¥118/月)' : 'Pro 档位 (¥538/月)',
-                    basePrice: targetM <= 350 ? 118 : 538,
-                    // 每周 1万 / 6万 积分硬顶，非高峰 5 折
-                    maxCapacityM: (targetM <= 350 ? 350 : 2100) * (1 + nightRatio * 0.5),
-                    bottleneck: '每 7 天积分硬顶，突击编码易提前用尽'
-                }
-            ];
-
-            const results = plans.map(p => {
-                if (p.calcCost) {
-                    const cost = p.calcCost(targetM);
-                    return {
-                        ...p,
-                        totalCost: cost,
-                        coverage: 1.0,
-                        missingM: 0,
-                        desc: '随用随扣，100% 刚好满足'
-                    };
-                }
-                const cap = p.maxCapacityM;
-                if (cap >= targetM) {
-                    // 套餐完全够用
-                    return {
-                        ...p,
-                        totalCost: p.basePrice,
-                        coverage: 1.0,
-                        missingM: 0,
-                        desc: `套餐容量约 ${cap.toFixed(0)}M（完全覆盖）`
-                    };
-                }
-                // 套餐不够用：基础价 + 缺口按 API 补足
-                const missing = targetM - cap;
-                const extraCost = missing * dsUnitPricePerM;
-                const total = p.basePrice + extraCost;
-                return {
-                    ...p,
-                    totalCost: total,
-                    coverage: cap / targetM,
-                    missingM: missing,
-                    desc: `套餐抗 ${cap.toFixed(0)}M，缺口 ${missing.toFixed(0)}M 需补 API 约 ¥${extraCost.toFixed(0)}`
+        const readDomCart = () => {
+            const next = readCalcCart();
+            next.targetB = Math.max(0.01, Number(document.getElementById('calc-target-b').value) || 20);
+            next.nightPercent = Math.min(100, Math.max(0, Number(document.getElementById('calc-night-percent').value) || 0));
+            next.apiMode = document.getElementById('calc-api-mode').value;
+            next.customApiCost = Math.max(0, Number(document.getElementById('calc-custom-api-cost').value) || 0);
+            next.quantities = {};
+            next.overrides = {};
+            bodyContent.querySelectorAll('[data-cart-row]').forEach(rowEl => {
+                const id = rowEl.getAttribute('data-cart-row');
+                const quantity = Math.floor(Math.max(0, Number(rowEl.querySelector('[data-cart-quantity]').value) || 0));
+                const checked = rowEl.querySelector('[data-cart-check]').checked;
+                next.quantities[id] = checked ? quantity : 0;
+                next.overrides[id] = {
+                    price: rowEl.querySelector('[data-cart-price]').value.trim(),
+                    currency: rowEl.querySelector('[data-cart-currency]').value,
+                    capacityB: rowEl.querySelector('[data-cart-capacity]').value.trim()
                 };
             });
+            saveCalcCart(next);
+            return next;
+        };
 
-            // 按真实总支出升序排序
-            results.sort((a, b) => a.totalCost - b.totalCost);
+        const recalculate = () => {
+            const current = readDomCart();
+            const apiCostPerB = calculateApiCostPerB(current.apiMode, current.nightPercent, current.customApiCost);
+            const selected = [];
+            let totalAccounts = 0;
+            let subscriptionCost = 0;
+            let unknownPriceCount = 0;
+            let unknownCapacityCount = 0;
+            let knownCapacity = 0;
+            rows.forEach(row => {
+                const quantity = Math.floor(Math.max(0, Number(current.quantities[row.id]) || 0));
+                if (!quantity) return;
+                const override = current.overrides[row.id] || {};
+                const price = getAccountPrice(row, override, rates);
+                const capacity = getAccountCapacity(row, override);
+                const provider = providers.get(row.providerId) || { name: row.providerId };
+                totalAccounts += quantity;
+                if (Number.isFinite(price.cny)) subscriptionCost += price.cny * quantity;
+                else unknownPriceCount += quantity;
+                if (Number.isFinite(capacity)) knownCapacity += capacity * quantity;
+                else unknownCapacityCount += quantity;
+                selected.push({ row, provider, quantity, price, capacity });
+            });
+            const targetB = current.targetB;
+            const coverage = targetB > 0 ? Math.min(1, knownCapacity / targetB) : 0;
+            const gapB = Math.max(0, targetB - knownCapacity);
+            const fallbackCost = gapB * apiCostPerB;
+            const pureApiCost = targetB * apiCostPerB;
+            const hasUnknownPrice = unknownPriceCount > 0;
+            const hasUnknownCapacity = unknownCapacityCount > 0;
+            const effectiveCost = hasUnknownPrice ? NaN : subscriptionCost + fallbackCost;
+            const savings = Number.isFinite(effectiveCost) ? pureApiCost - effectiveCost : NaN;
+            const selectedHtml = selected.length ? selected.map(item => {
+                const capText = Number.isFinite(item.capacity) ? (item.capacity * item.quantity).toFixed(2) + 'B' : '未知容量未计入';
+                const priceText = Number.isFinite(item.price.cny) ? formatCny(item.price.cny * item.quantity) : '待补价';
+                return '<div class="llm-rank-item"><div><strong>' + escapeHtml(item.provider.name) + ' · ' + escapeHtml(item.row.plan) + '</strong><div class="llm-muted">' + item.quantity + ' 个账号；计入容量 ' + escapeHtml(capText) + '；订阅费 ' + escapeHtml(priceText) + '</div></div><div class="llm-muted" style="text-align:right;">' + escapeHtml(item.row.bottleneck) + '</div></div>';
+            }).join('') : '<div class="llm-card">购物车为空。请在上方勾选账号并设置数量。</div>';
+            const warnings = [];
+            if (hasUnknownCapacity) warnings.push('有 ' + unknownCapacityCount + ' 个账号未提供 Token/额度容量，达成率和 API 缺口只是已知容量的下界');
+            if (hasUnknownPrice) warnings.push('有 ' + unknownPriceCount + ' 个账号没有可换算价格，请填写价格覆盖；总成本暂不闭合');
+            if (current.apiMode === 'custom' && current.customApiCost <= 0) warnings.push('你选择了自定义 API 单价，但当前是 0；请填写真实的 ¥/B Token');
+            if (selected.some(item => item.row.capacityMode === 'official-credit')) warnings.push('MiMo 当前官方口径是 Credits，不一定等于裸 Token；建议用你的实际账单/实测值覆盖容量');
+            const costText = Number.isFinite(effectiveCost) ? formatCny(effectiveCost) : '待补价格';
+            const savingsText = Number.isFinite(savings) ? formatCny(savings) + '（' + (pureApiCost > 0 ? (savings / pureApiCost * 100).toFixed(1) : '0.0') + '%）' : '待补价格';
+            document.getElementById('llm-calc-summary').innerHTML = [
+                '<div class="llm-card">',
+                '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">',
+                '<div><div class="llm-muted">已选账号</div><strong>' + totalAccounts + ' 个</strong></div>',
+                '<div><div class="llm-muted">已知容量合计</div><strong>' + knownCapacity.toFixed(2) + 'B</strong></div>',
+                '<div><div class="llm-muted">目标达成率</div><strong>' + (coverage * 100).toFixed(1) + '%</strong></div>',
+                '<div><div class="llm-muted">已知容量缺口</div><strong>' + gapB.toFixed(2) + 'B</strong></div>',
+                '<div><div class="llm-muted">订阅月费（已知价格）</div><strong>' + formatCny(subscriptionCost) + '</strong></div>',
+                '<div><div class="llm-muted">API 兜底缺口成本</div><strong>' + formatCny(fallbackCost) + '</strong></div>',
+                '<div><div class="llm-muted">购物车有效月成本</div><strong>' + escapeHtml(costText) + '</strong></div>',
+                '<div><div class="llm-muted">纯 API 基准</div><strong>' + formatCny(pureApiCost) + '</strong></div>',
+                '<div><div class="llm-muted">相对纯 API 节省</div><strong>' + escapeHtml(savingsText) + '</strong></div>',
+                '</div>',
+                '<div style="margin-top:10px;"><strong>本次购物车</strong>' + selectedHtml + '</div>',
+                (warnings.length ? '<div class="llm-highlight-promo">⚠️ ' + escapeHtml(warnings.join('；')) + '</div>' : ''),
+                '<div class="llm-muted">说明：总容量只计算勾选数量 × 单账号容量；没有自动挑选、自动分配或自动补账号。币种先按“厂商配置”的汇率折算，海外页面的原始币种不会被 IP 推断覆盖。</div>',
+                '</div>'
+            ].join('');
+        };
 
-            document.getElementById('llm-calc-results').innerHTML = results.map((item, idx) => `
-                <div class="llm-rank-item">
-                    <div style="max-width: 72%;">
-                        <div>
-                            <strong style="color: ${idx === 0 ? '#3fb950' : '#58a6ff'};">#${idx + 1} ${escapeHtml(item.name)}</strong>
-                            <span class="llm-muted" style="margin-left: 6px;">[${escapeHtml(item.tier)}]</span>
-                        </div>
-                        <div class="llm-muted" style="margin-top:3px;">
-                            ${escapeHtml(item.desc)}
-                        </div>
-                        <div class="llm-muted" style="font-size:10px; color:#8b949e;">
-                            约束短板：${escapeHtml(item.bottleneck)}
-                        </div>
-                    </div>
-                    <div style="text-align: right;">
-                        <strong style="color: ${item.missingM === 0 ? '#3fb950' : '#e3b341'}; font-size:14px;">
-                            约 ¥${item.totalCost.toFixed(0)} / 月
-                        </strong>
-                        <div class="llm-muted" style="font-size:11px;">
-                            覆盖率 ${(item.coverage * 100).toFixed(0)}%
-                        </div>
-                    </div>
-                </div>
-            `).join('');
-        }
-
-        document.getElementById('calc-monthly-tokens-m').addEventListener('input', recalculate);
-        document.getElementById('calc-night-ratio-input').addEventListener('input', recalculate);
+        bodyContent.querySelectorAll('input, select').forEach(element => {
+            element.addEventListener('input', recalculate);
+            element.addEventListener('change', recalculate);
+        });
+        bodyContent.querySelectorAll('[data-cart-check]').forEach(check => {
+            check.addEventListener('change', () => {
+                const row = check.closest('[data-cart-row]');
+                const quantity = row?.querySelector('[data-cart-quantity]');
+                if (!quantity) return;
+                if (check.checked && Number(quantity.value) <= 0) quantity.value = '1';
+                if (!check.checked) quantity.value = '0';
+                recalculate();
+            });
+        });
+        bodyContent.querySelector('#llm-clear-cart').addEventListener('click', () => {
+            saveCalcCart({ targetB: 20, nightPercent: 40, apiMode: API_COST_PROFILES[0].id, customApiCost: 0, quantities: {}, overrides: {} });
+            renderCalc();
+        });
         recalculate();
     }
 
     function renderSettings() {
         const providers = getAllProviders();
-        let html = `
-            <div class="llm-muted" style="margin-bottom: 12px;">
-                配置保存于本地油猴沙箱。取消勾选可将厂商移出面板；修改地址即覆盖本地设置。每行格式：标题 | URL
-            </div>
-            <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-                <button class="llm-btn" id="llm-save-settings">保存全部配置</button>
-                <button class="llm-btn" id="llm-reset-settings">恢复初始默认</button>
-            </div>
-        `;
-        providers.forEach(p => {
-            const pricing = getUsableLinks(p, 'pricing');
-            const updates = getUsableLinks(p, 'updates');
-            html += `
-                <div class="llm-settings-row" data-provider-settings="${escapeHtml(p.id)}">
-                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
-                        <label style="font-size: 13px; font-weight: 600;">
-                            <input type="checkbox" data-provider-enabled ${p.enabled ? 'checked' : ''} />
-                            ${escapeHtml(p.name)} <span class="llm-muted">(${escapeHtml(p.category)})</span>
-                        </label>
-                    </div>
-                    <label class="llm-settings-label">定价/套餐地址</label>
-                    <textarea data-links="pricing">${escapeHtml(pricing.map(l => `${l.title} \vert{}${l.url}`).join('\n'))}</textarea>
-                    <label class="llm-settings-label">更新/公告地址</label>
-                    <textarea data-links="updates">${escapeHtml(updates.map(l => `${l.title} \vert{}${l.url}`).join('\n'))}</textarea>
-                </div>
-            `;
+        const app = readAppSettings();
+        const displayCurrencies = ['CNY', 'USD', 'EUR', 'GBP', 'JPY', 'HKD', 'KRW', 'SGD', 'CAD', 'AUD'];
+        const currencyOptions = displayCurrencies.map(code => '<option value="' + code + '"' + (normalizeCurrencyCode(app.currency.display) === code ? ' selected' : '') + '>' + code + '</option>').join('');
+        let html = [
+            '<div class="llm-card">',
+            '<div style="font-size:13px;font-weight:600;margin-bottom:6px;">使用说明</div>',
+            '<div class="llm-muted" style="line-height:1.7;">这里的“厂商启用”控制矩阵、雷达和购物车是否显示该厂商；下面的地址是本地覆盖项，改成新的官方定价/公告 URL 后保存即可。AI 只在你打开开关并填写 Key 后工作，AI 输出必须人工确认，不会自动改写主数据。</div>',
+            '</div>',
+            '<div class="llm-settings-row">',
+            '<div style="font-size:13px;font-weight:600;">AI 页面抽取（可选）</div>',
+            '<div class="llm-muted" style="margin-top:4px;line-height:1.6;">用于动态页面、正文结构变化或普通抽取不完整时的辅助整理。Endpoint 需兼容 OpenAI Chat Completions；Key 只写入当前浏览器的油猴本地存储，不会写入脚本或 Git。</div>',
+            '<label class="llm-settings-label"><input type="checkbox" data-ai-enabled ' + (app.ai.enabled ? 'checked' : '') + ' /> 启用 AI 抽取</label>',
+            '<label class="llm-settings-label">Endpoint</label><input type="text" data-ai-endpoint value="' + escapeHtml(app.ai.endpoint) + '" />',
+            '<label class="llm-settings-label">模型名</label><input type="text" data-ai-model value="' + escapeHtml(app.ai.model) + '" />',
+            '<label class="llm-settings-label">API Key（本地保存）</label><input type="password" data-ai-key value="' + escapeHtml(app.ai.apiKey) + '" autocomplete="off" />',
+            '<label class="llm-settings-label"><input type="checkbox" data-ai-first-check ' + (app.ai.runOnFirstCheck ? 'checked' : '') + ' /> 首次检查或正文过短时自动调用 AI（会产生 API 费用）</label>',
+            '<label class="llm-settings-label">送入 AI 的最大正文字符数</label><input type="number" data-ai-max-chars min="3000" max="' + MAX_AI_EXCERPT_CHARS + '" step="500" value="' + Number(app.ai.maxExcerptChars || 14000) + '" />',
+            '</div>',
+            '<div class="llm-settings-row">',
+            '<div style="font-size:13px;font-weight:600;">币种与汇率</div>',
+            '<div class="llm-muted" style="margin-top:4px;line-height:1.6;">金额保留来源原币种；下方汇率仅用于换算人民币。格式为“外币代码=人民币金额”，例如 USD=7.20。国外页面没有明确币种时显示待确认，不会根据 IP 猜测。</div>',
+            '<label class="llm-settings-label">来源显示币种（购物车测算统一用 CNY）</label><select data-currency-display>' + currencyOptions + '</select>',
+            '<label class="llm-settings-label">汇率（1 外币 = 多少 CNY）</label><textarea data-currency-rates>' + escapeHtml(app.currency.rates) + '</textarea>',
+            '</div>',
+            '<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">',
+            '<button class="llm-btn" id="llm-save-settings">保存全部配置</button>',
+            '<button class="llm-btn" id="llm-reset-settings">恢复初始默认</button>',
+            '</div>',
+            '<div class="llm-muted" style="margin-bottom:8px;">厂商开关与来源地址</div>'
+        ].join('');
+        providers.forEach(provider => {
+            const pricing = getUsableLinks(provider, 'pricing');
+            const updates = getUsableLinks(provider, 'updates');
+            html += [
+                '<div class="llm-settings-row" data-provider-settings="' + escapeHtml(provider.id) + '">',
+                '<label style="font-size:13px;font-weight:600;"><input type="checkbox" data-provider-enabled ' + (provider.enabled ? 'checked' : '') + ' /> ' + escapeHtml(provider.name) + ' <span class="llm-muted">(' + escapeHtml(provider.category) + ')</span></label>',
+                '<label class="llm-settings-label">定价/套餐地址（每行：标题 | URL）</label>',
+                '<textarea data-links="pricing">' + escapeHtml(pricing.map(link => link.title + ' | ' + link.url).join('\n')) + '</textarea>',
+                '<label class="llm-settings-label">更新/公告地址（每行：标题 | URL）</label>',
+                '<textarea data-links="updates">' + escapeHtml(updates.map(link => link.title + ' | ' + link.url).join('\n')) + '</textarea>',
+                '</div>'
+            ].join('');
         });
         bodyContent.innerHTML = html;
 
         bodyContent.querySelector('#llm-save-settings').addEventListener('click', () => {
-            const settings = readProviderSettings();
+            const providerSettings = readProviderSettings();
             bodyContent.querySelectorAll('[data-provider-settings]').forEach(row => {
                 const id = row.getAttribute('data-provider-settings');
-                settings[id] = {
-                    ...(settings[id] || {}),
+                providerSettings[id] = {
+                    ...(providerSettings[id] || {}),
                     enabled: row.querySelector('[data-provider-enabled]').checked,
                     links: {
                         pricing: parseLinkLines(row.querySelector('[data-links="pricing"]').value),
@@ -1130,12 +1883,28 @@
                     }
                 };
             });
-            saveProviderSettings(settings);
+            saveProviderSettings(providerSettings);
+            saveAppSettings({
+                ai: {
+                    enabled: bodyContent.querySelector('[data-ai-enabled]').checked,
+                    endpoint: bodyContent.querySelector('[data-ai-endpoint]').value.trim(),
+                    model: bodyContent.querySelector('[data-ai-model]').value.trim(),
+                    apiKey: bodyContent.querySelector('[data-ai-key]').value.trim(),
+                    runOnFirstCheck: bodyContent.querySelector('[data-ai-first-check]').checked,
+                    maxExcerptChars: Math.min(MAX_AI_EXCERPT_CHARS, Math.max(3000, Number(bodyContent.querySelector('[data-ai-max-chars]').value) || 14000))
+                },
+                currency: {
+                    display: bodyContent.querySelector('[data-currency-display]').value,
+                    rates: bodyContent.querySelector('[data-currency-rates]').value.trim()
+                }
+            });
             renderSettings();
         });
 
         bodyContent.querySelector('#llm-reset-settings').addEventListener('click', () => {
             saveProviderSettings({});
+            saveAppSettings(DEFAULT_APP_SETTINGS);
+            saveCalcCart({ targetB: 20, nightPercent: 40, apiMode: API_COST_PROFILES[0].id, customApiCost: 0, quantities: {}, overrides: {} });
             renderSettings();
         });
     }
