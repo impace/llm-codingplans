@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.7.0
+// @version      2.7.1
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -226,7 +226,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.7.0';
+    const APP_VERSION = '2.7.1';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -253,7 +253,7 @@
     };
 
     // 这里只放“可公开核对或明确标注未知”的基准，不把调用次数/积分
-    // 擅自换算成 Token。未知容量由用户在购物车中按自己的实测填写。
+    // 擅自换算成 Token。未知容量保持未知，不要求用户在购物车中手动补填。
     const CART_ACCOUNT_ROWS = [
         { id: 'bailian-lite', providerId: 'bailian', plan: 'Lite', price: 39, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '约 2,500 Credits / 7 天；Credits 与 Token 的换算需实测', evidence: '官方给出 Credits，未给出稳定 Token 等价物' },
         { id: 'bailian-essential', providerId: 'bailian', plan: 'Essential', price: 79, currency: 'CNY', capacityB: null, capacityMode: 'unknown', bottleneck: '约 5,625 Credits / 7 天；Credits 与 Token 的换算需实测', evidence: '官方给出 Credits，未给出稳定 Token 等价物' },
@@ -1233,7 +1233,7 @@
 
     function formatCny(value) {
         const amount = Number(value);
-        return Number.isFinite(amount) ? '¥' + amount.toFixed(2) : '待补价';
+        return Number.isFinite(amount) ? '¥' + amount.toFixed(2) : '待定';
     }
 
     function readCalcCart() {
@@ -1245,6 +1245,7 @@
             apiMode: String(source.apiMode || API_COST_PROFILES[0].id),
             customApiCost: Number.isFinite(Number(source.customApiCost)) ? Math.max(0, Number(source.customApiCost)) : 0,
             quantities: source.quantities && typeof source.quantities === 'object' ? source.quantities : {},
+            // 兼容旧版本已保存的数据；购物车不再展示或写入覆盖值。
             overrides: source.overrides && typeof source.overrides === 'object' ? source.overrides : {}
         };
     }
@@ -1255,8 +1256,7 @@
             nightPercent: Math.min(100, Math.max(0, Number(cart.nightPercent) || 0)),
             apiMode: String(cart.apiMode || API_COST_PROFILES[0].id),
             customApiCost: Math.max(0, Number(cart.customApiCost) || 0),
-            quantities: cart.quantities && typeof cart.quantities === 'object' ? cart.quantities : {},
-            overrides: cart.overrides && typeof cart.overrides === 'object' ? cart.overrides : {}
+            quantities: cart.quantities && typeof cart.quantities === 'object' ? cart.quantities : {}
         });
     }
 
@@ -1265,23 +1265,19 @@
         return CART_ACCOUNT_ROWS.filter(row => enabledIds.has(row.providerId));
     }
 
-    function getAccountPrice(row, override, rates) {
-        const hasOverride = override && override.price !== '' && Number.isFinite(Number(override.price));
+    function getAccountPrice(row, rates) {
         const baseAmount = row.price === null || row.price === undefined || row.price === '' ? NaN : Number(row.price);
-        const amount = hasOverride ? Number(override.price) : baseAmount;
-        const currency = normalizeCurrencyCode(override?.currency || row.currency);
+        const currency = normalizeCurrencyCode(row.currency);
         return {
-            amount: Number.isFinite(amount) && amount >= 0 ? amount : NaN,
+            amount: Number.isFinite(baseAmount) && baseAmount >= 0 ? baseAmount : NaN,
             currency,
-            cny: convertToCny(amount, currency, rates)
+            cny: convertToCny(baseAmount, currency, rates)
         };
     }
 
-    function getAccountCapacity(row, override) {
-        const hasOverride = override && override.capacityB !== '' && Number.isFinite(Number(override.capacityB));
+    function getAccountCapacity(row) {
         const baseCapacity = row.capacityB === null || row.capacityB === undefined || row.capacityB === '' ? NaN : Number(row.capacityB);
-        const candidate = hasOverride ? Number(override.capacityB) : baseCapacity;
-        return Number.isFinite(candidate) && candidate >= 0 ? candidate : NaN;
+        return Number.isFinite(baseCapacity) && baseCapacity >= 0 ? baseCapacity : NaN;
     }
 
     function calculateApiCostPerB(mode, nightPercent, customCost) {
@@ -1661,22 +1657,20 @@
         const cart = readCalcCart();
         const rows = getCartRows();
         const providers = new Map(getAllProviders().map(provider => [provider.id, provider]));
-        const currencies = ['CNY', 'USD', 'EUR', 'GBP', 'JPY', 'HKD', 'KRW', 'SGD', 'CAD', 'AUD'];
         const apiOptions = API_COST_PROFILES.map(profile => '<option value="' + escapeHtml(profile.id) + '"' + (cart.apiMode === profile.id ? ' selected' : '') + '>' + escapeHtml(profile.name) + '</option>').join('');
         const formatDefaultPrice = row => {
-            const price = getAccountPrice(row, {}, rates);
+            const price = getAccountPrice(row, rates);
             if (!Number.isFinite(price.cny)) return '价格未知';
             return escapeHtml(currencySymbol(price.currency) + Number(price.amount).toFixed(2) + ' ≈ ¥' + price.cny.toFixed(2));
         };
-        const currencyOptions = current => currencies.map(code => '<option value="' + code + '"' + (normalizeCurrencyCode(current) === code ? ' selected' : '') + '>' + code + '</option>').join('');
         const rowHtml = rows.map(row => {
             const provider = providers.get(row.providerId) || { name: row.providerId };
-            const saved = cart.overrides[row.id] && typeof cart.overrides[row.id] === 'object' ? cart.overrides[row.id] : {};
             const quantity = Math.floor(Math.max(0, Number(cart.quantities[row.id]) || 0));
-            const defaultCapacity = Number.isFinite(Number(row.capacityB)) ? Number(row.capacityB).toFixed(2) + 'B' : '未知，需手填';
-            const baselinePrice = getAccountPrice(row, {}, rates);
+            const hasCapacity = row.capacityB !== null && row.capacityB !== undefined && row.capacityB !== '' && Number.isFinite(Number(row.capacityB));
+            const defaultCapacity = hasCapacity ? Number(row.capacityB).toFixed(2) + 'B' : '未知';
+            const baselinePrice = getAccountPrice(row, rates);
             const unitCost = Number.isFinite(baselinePrice.cny) && Number(row.capacityB) > 0 ? '；约 ¥' + (baselinePrice.cny / Number(row.capacityB)).toFixed(2) + '/B' : '';
-            const modeLabel = row.capacityMode === 'official-credit' ? '官方 Credits（按 B 暂计，建议用实测覆盖）' : (row.capacityMode === 'official-token' ? '官方计量值' : '未公开 Token 容量');
+            const modeLabel = row.capacityMode === 'official-credit' ? '官方 Credits（标称 B，口径需核实）' : (row.capacityMode === 'official-token' ? '官方计量值' : 'Token 容量未知');
             return [
                 '<div class="llm-settings-row" data-cart-row="' + escapeHtml(row.id) + '">',
                 '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">',
@@ -1687,12 +1681,7 @@
                 '</label>',
                 '<span class="llm-muted" style="text-align:right;">单账号上限：' + escapeHtml(defaultCapacity + unitCost) + '</span>',
                 '</div>',
-                '<div class="llm-grid-details" style="margin-top:8px;">',
-                '<div><strong>价格覆盖：</strong><input class="llm-input-num" style="width:86px;" type="number" min="0" step="0.01" data-cart-price value="' + escapeHtml(saved.price === undefined ? '' : saved.price) + '" placeholder="' + (row.price === null ? '必填' : '默认') + '" /> ',
-                '<select data-cart-currency style="background:rgba(0,0,0,.35);border:1px solid var(--llm-border);color:#fff;padding:6px;border-radius:6px;">' + currencyOptions(saved.currency || row.currency) + '</select></div>',
-                '<div><strong>容量覆盖：</strong><input class="llm-input-num" style="width:86px;" type="number" min="0" step="0.01" data-cart-capacity value="' + escapeHtml(saved.capacityB === undefined ? '' : saved.capacityB) + '" placeholder="' + (Number.isFinite(Number(row.capacityB)) ? '默认' : '必填') + '" /> B Token/额度</div>',
-                '</div>',
-                '<div class="llm-muted">数量 <input class="llm-input-num" style="width:76px;" type="number" min="0" step="1" data-cart-quantity value="' + quantity + '" />；' + escapeHtml(modeLabel) + '；短板：' + escapeHtml(row.bottleneck) + '</div>',
+                '<div class="llm-muted" style="margin-top:8px;">购买数量 <input class="llm-input-num" style="width:76px;" type="number" min="0" step="1" data-cart-quantity value="' + quantity + '" /> 个；' + escapeHtml(modeLabel) + '；短板：' + escapeHtml(row.bottleneck) + '</div>',
                 '<div class="llm-muted" style="margin-top:3px;">证据口径：' + escapeHtml(row.evidence) + '</div>',
                 '</div>'
             ].join('');
@@ -1701,7 +1690,8 @@
         bodyContent.innerHTML = [
             '<div class="llm-calc-box">',
             '<div style="font-weight:600;margin-bottom:10px;font-size:14px;">🧮 单账号极限基准 + 自选购物车大盘</div>',
-            '<div class="llm-muted" style="line-height:1.7;">这里不替你自动挑套餐，也不假设一个账号能被算法分配给不同任务。你先看每个账号公开的单号上限，再勾选要实际购买的账号数量；系统只汇总你的选择。未知容量按 0 计入，必须填“容量覆盖”后才会进入大盘。</div>',
+            '<div class="llm-muted" style="line-height:1.7;">这里只需要勾选账号并填写购买数量。系统按脚本内的单账号基准汇总你的选择，不替你自动挑选、分配或补账号。未知容量保持未知，不纳入已知容量统计；未知价格显示为待定。</div>',
+            '<div class="llm-muted" style="line-height:1.7;margin-top:6px;">操作：每行勾选 = 纳入购物车，购买数量 = 买几个。上面的目标月用量（默认 20B）只是大盘对比目标；API 兜底基准只用于缺口和纯 API 参考，不是账号购买数量。</div>',
             '<div class="llm-input-group" style="margin-top:12px;"><span>目标月用量：</span><span><input type="number" id="calc-target-b" class="llm-input-num" min="0.01" step="0.1" value="' + cart.targetB + '" /> B Token</span></div>',
             '<div class="llm-input-group"><span>闲时/夜间占比：</span><span><input type="number" id="calc-night-percent" class="llm-input-num" min="0" max="100" step="1" value="' + cart.nightPercent + '" /> %</span></div>',
             '<div class="llm-input-group"><span>API 兜底基准：</span><span><select id="calc-api-mode" style="background:rgba(0,0,0,.35);border:1px solid var(--llm-border);color:#fff;padding:6px;border-radius:6px;">' + apiOptions + '</select></span></div>',
@@ -1712,7 +1702,7 @@
             '<div id="llm-cart-list">' + (rowHtml || '<div class="llm-card">当前没有启用的厂商账号，请先到“厂商配置”启用。</div>') + '</div>',
             '<div style="font-size:13px;font-weight:600;margin:14px 0 8px;">② 自选购物车大盘</div>',
             '<div id="llm-calc-summary"></div>',
-            '<div style="margin-top:8px;"><button class="llm-btn" id="llm-clear-cart">清空购物车勾选与覆盖值</button></div>'
+            '<div style="margin-top:8px;"><button class="llm-btn" id="llm-clear-cart">清空购物车勾选与数量</button></div>'
         ].join('');
 
         const readDomCart = () => {
@@ -1722,17 +1712,11 @@
             next.apiMode = document.getElementById('calc-api-mode').value;
             next.customApiCost = Math.max(0, Number(document.getElementById('calc-custom-api-cost').value) || 0);
             next.quantities = {};
-            next.overrides = {};
             bodyContent.querySelectorAll('[data-cart-row]').forEach(rowEl => {
                 const id = rowEl.getAttribute('data-cart-row');
                 const quantity = Math.floor(Math.max(0, Number(rowEl.querySelector('[data-cart-quantity]').value) || 0));
                 const checked = rowEl.querySelector('[data-cart-check]').checked;
                 next.quantities[id] = checked ? quantity : 0;
-                next.overrides[id] = {
-                    price: rowEl.querySelector('[data-cart-price]').value.trim(),
-                    currency: rowEl.querySelector('[data-cart-currency]').value,
-                    capacityB: rowEl.querySelector('[data-cart-capacity]').value.trim()
-                };
             });
             saveCalcCart(next);
             return next;
@@ -1750,9 +1734,8 @@
             rows.forEach(row => {
                 const quantity = Math.floor(Math.max(0, Number(current.quantities[row.id]) || 0));
                 if (!quantity) return;
-                const override = current.overrides[row.id] || {};
-                const price = getAccountPrice(row, override, rates);
-                const capacity = getAccountCapacity(row, override);
+                const price = getAccountPrice(row, rates);
+                const capacity = getAccountCapacity(row);
                 const provider = providers.get(row.providerId) || { name: row.providerId };
                 totalAccounts += quantity;
                 if (Number.isFinite(price.cny)) subscriptionCost += price.cny * quantity;
@@ -1771,17 +1754,17 @@
             const effectiveCost = hasUnknownPrice ? NaN : subscriptionCost + fallbackCost;
             const savings = Number.isFinite(effectiveCost) ? pureApiCost - effectiveCost : NaN;
             const selectedHtml = selected.length ? selected.map(item => {
-                const capText = Number.isFinite(item.capacity) ? (item.capacity * item.quantity).toFixed(2) + 'B' : '未知容量未计入';
-                const priceText = Number.isFinite(item.price.cny) ? formatCny(item.price.cny * item.quantity) : '待补价';
+                const capText = Number.isFinite(item.capacity) ? (item.capacity * item.quantity).toFixed(2) + 'B' : '未知（未计入已知容量）';
+                const priceText = Number.isFinite(item.price.cny) ? formatCny(item.price.cny * item.quantity) : '待定';
                 return '<div class="llm-rank-item"><div><strong>' + escapeHtml(item.provider.name) + ' · ' + escapeHtml(item.row.plan) + '</strong><div class="llm-muted">' + item.quantity + ' 个账号；计入容量 ' + escapeHtml(capText) + '；订阅费 ' + escapeHtml(priceText) + '</div></div><div class="llm-muted" style="text-align:right;">' + escapeHtml(item.row.bottleneck) + '</div></div>';
             }).join('') : '<div class="llm-card">购物车为空。请在上方勾选账号并设置数量。</div>';
             const warnings = [];
-            if (hasUnknownCapacity) warnings.push('有 ' + unknownCapacityCount + ' 个账号未提供 Token/额度容量，达成率和 API 缺口只是已知容量的下界');
-            if (hasUnknownPrice) warnings.push('有 ' + unknownPriceCount + ' 个账号没有可换算价格，请填写价格覆盖；总成本暂不闭合');
+            if (hasUnknownCapacity) warnings.push('有 ' + unknownCapacityCount + ' 个账号的 Token/额度容量未知，达成率和 API 缺口只按已知容量计算，不自动估算');
+            if (hasUnknownPrice) warnings.push('有 ' + unknownPriceCount + ' 个账号没有可换算价格，总成本暂不闭合；请更新脚本内的价格基准');
             if (current.apiMode === 'custom' && current.customApiCost <= 0) warnings.push('你选择了自定义 API 单价，但当前是 0；请填写真实的 ¥/B Token');
             if (selected.some(item => item.row.capacityMode === 'official-credit')) warnings.push('MiMo 当前官方口径是 Credits，不一定等于裸 Token；建议用你的实际账单/实测值覆盖容量');
-            const costText = Number.isFinite(effectiveCost) ? formatCny(effectiveCost) : '待补价格';
-            const savingsText = Number.isFinite(savings) ? formatCny(savings) + '（' + (pureApiCost > 0 ? (savings / pureApiCost * 100).toFixed(1) : '0.0') + '%）' : '待补价格';
+            const costText = Number.isFinite(effectiveCost) ? formatCny(effectiveCost) : '待定';
+            const savingsText = Number.isFinite(savings) ? formatCny(savings) + '（' + (pureApiCost > 0 ? (savings / pureApiCost * 100).toFixed(1) : '0.0') + '%）' : '待定';
             document.getElementById('llm-calc-summary').innerHTML = [
                 '<div class="llm-card">',
                 '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">',
@@ -1797,7 +1780,7 @@
                 '</div>',
                 '<div style="margin-top:10px;"><strong>本次购物车</strong>' + selectedHtml + '</div>',
                 (warnings.length ? '<div class="llm-highlight-promo">⚠️ ' + escapeHtml(warnings.join('；')) + '</div>' : ''),
-                '<div class="llm-muted">说明：总容量只计算勾选数量 × 单账号容量；没有自动挑选、自动分配或自动补账号。币种先按“厂商配置”的汇率折算，海外页面的原始币种不会被 IP 推断覆盖。</div>',
+                '<div class="llm-muted">说明：总容量只计算勾选数量 × 脚本内单账号容量；没有自动挑选、自动分配或自动补账号。未知容量不估算，未知价格不按 0 计算。币种按“厂商配置”的汇率折算，海外页面的原始币种不会被 IP 推断覆盖。</div>',
                 '</div>'
             ].join('');
         };
@@ -1817,7 +1800,8 @@
             });
         });
         bodyContent.querySelector('#llm-clear-cart').addEventListener('click', () => {
-            saveCalcCart({ targetB: 20, nightPercent: 40, apiMode: API_COST_PROFILES[0].id, customApiCost: 0, quantities: {}, overrides: {} });
+            const current = readCalcCart();
+            saveCalcCart({ ...current, quantities: {} });
             renderCalc();
         });
         recalculate();
@@ -1904,7 +1888,7 @@
         bodyContent.querySelector('#llm-reset-settings').addEventListener('click', () => {
             saveProviderSettings({});
             saveAppSettings(DEFAULT_APP_SETTINGS);
-            saveCalcCart({ targetB: 20, nightPercent: 40, apiMode: API_COST_PROFILES[0].id, customApiCost: 0, quantities: {}, overrides: {} });
+            saveCalcCart({ targetB: 20, nightPercent: 40, apiMode: API_COST_PROFILES[0].id, customApiCost: 0, quantities: {} });
             renderSettings();
         });
     }
