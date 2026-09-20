@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.7.1
+// @version      2.7.5
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -226,7 +226,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.7.1';
+    const APP_VERSION = '2.7.5';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -392,7 +392,8 @@
             const custom = savedLinks[type]
                 .filter(l => l && isHttpUrl(l.url))
                 .map(l => ({ title: String(l.title || '自定义来源').trim(), url: l.url.trim() }));
-            if (custom.length) links[type] = custom;
+            // 空数组也是用户明确保存的结果，允许用它清空内置来源。
+            links[type] = custom;
         });
         return links;
     }
@@ -467,6 +468,22 @@
         return AI_SNAPSHOT_KEY_PREFIX + hashText(url);
     }
 
+    function saveAiSnapshot(url, snapshot) {
+        const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
+        GM_setValue(aiSnapshotKey(url), {
+            sourceUrl: url,
+            fingerprint: String(source.fingerprint || ''),
+            status: String(source.status || ''),
+            checkedAt: source.checkedAt || new Date().toISOString(),
+            model: String(source.model || ''),
+            excerpt: String(source.excerpt || ''),
+            rates: source.rates && typeof source.rates === 'object' ? source.rates : {},
+            error: String(source.error || ''),
+            previousData: source.previousData && typeof source.previousData === 'object' ? source.previousData : null,
+            data: source.data && typeof source.data === 'object' ? source.data : null
+        });
+    }
+
     function normalizeCurrencyCode(value) {
         const raw = String(value || '').trim().toUpperCase();
         const aliases = {
@@ -497,8 +514,10 @@
     function inferCurrency(text, url) {
         const source = String(text || '');
         const explicit = source.match(/(?:currency|currency\s*code|币种|价格单位|prices?\s+in|priced\s+in|billing\s+in|金额)\s*[:：]?\s*(USD|EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/i)
+            || source.match(/(?:currency|currency\s*code|币种|价格单位|金额)\s*[:：]?\s*(人民币|元)/i)
             || source.match(/(?:^|[^\w])(USD|EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\s*(?=[0-9$€£¥￥])/i)
-            || source.match(/[0-9][0-9,.]*\s*(USD|EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/i);
+            || source.match(/[0-9][0-9,.]*\s*(USD|EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/i)
+            || source.match(/[0-9][0-9,.]*\s*(人民币|元)(?=[^\u4e00-\u9fff]|$)/i);
         if (explicit) return normalizeCurrencyCode(explicit[1]);
         if (/[€]/.test(source)) return 'EUR';
         if (/[£]/.test(source)) return 'GBP';
@@ -554,6 +573,7 @@
         const patterns = [
             /(?:USD|US\$|(?<![A-Za-z])\$)\s*([0-9][0-9,.]*)/gi,
             /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:USD|US\$|\$)(?!\s*[0-9])/gi,
+            /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:人民币|元)(?![A-Za-z])/gi,
             /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/gi,
             /(?:EUR|€)\s*([0-9][0-9,.]*)/gi,
             /(?:GBP|£)\s*([0-9][0-9,.]*)/gi,
@@ -782,16 +802,38 @@
         });
     }
 
-    async function maybeRunAiExtraction(url, result, previous, forceAi = false) {
+    async function maybeRunAiExtraction(url, result, previous, forceAi = false, skipAutoAi = false) {
         const settings = readAppSettings();
+        const previousAiExtraction = result.aiExtraction
+            || previous?.aiExtraction
+            || result.previousAiExtraction
+            || previous?.previousAiExtraction
+            || null;
+        const markAiFailure = () => {
+            if (previousAiExtraction) result.previousAiExtraction = previousAiExtraction;
+            result.aiExtraction = null;
+            result.aiCheckedAt = '';
+            result.aiModel = '';
+        };
         if (!settings.ai.enabled) {
-            if (forceAi) result.aiStatus = '未执行：请先在“厂商配置”中启用 AI';
+            if (forceAi) {
+                markAiFailure();
+                result.aiStatus = 'AI未执行：请先在“厂商配置”中启用 AI';
+                saveAiSnapshot(url, {
+                    fingerprint: result.fingerprint,
+                    status: '未执行',
+                    checkedAt: new Date().toISOString(),
+                    model: settings.ai.model,
+                    excerpt: result.aiExcerpt || '',
+                    rates: parseFxRates(settings.currency.rates),
+                    error: '请先在“厂商配置”中启用 AI',
+                    previousData: previousAiExtraction
+                });
+            }
             return result;
         }
         const shouldRun = forceAi
-            || Boolean(result.changed)
-            || Boolean(result.weak)
-            || Boolean(settings.ai.runOnFirstCheck && !previous);
+            || (!skipAutoAi && Boolean(settings.ai.runOnFirstCheck && (result.changed || result.weak || !previous)));
         if (!shouldRun) return result;
         const reason = forceAi
             ? '用户手动要求 AI 复核'
@@ -799,11 +841,11 @@
         const aiResult = await requestAiExtraction(url, result, reason);
         if (aiResult.ok) {
             result.aiExtraction = aiResult.data;
+            delete result.previousAiExtraction;
             result.aiStatus = '待人工确认';
             result.aiCheckedAt = aiResult.checkedAt;
             result.aiModel = aiResult.model;
-            GM_setValue(aiSnapshotKey(url), {
-                sourceUrl: url,
+            saveAiSnapshot(url, {
                 fingerprint: result.fingerprint || '',
                 status: '待人工确认',
                 checkedAt: aiResult.checkedAt,
@@ -813,9 +855,31 @@
                 data: aiResult.data
             });
         } else if (aiResult.skipped) {
+            markAiFailure();
             result.aiStatus = 'AI未执行：' + aiResult.error;
+            saveAiSnapshot(url, {
+                fingerprint: result.fingerprint,
+                status: '未执行',
+                checkedAt: new Date().toISOString(),
+                model: settings.ai.model,
+                excerpt: result.aiExcerpt || '',
+                rates: parseFxRates(settings.currency.rates),
+                error: aiResult.error,
+                previousData: previousAiExtraction
+            });
         } else {
+            markAiFailure();
             result.aiStatus = 'AI失败：' + aiResult.error;
+            saveAiSnapshot(url, {
+                fingerprint: result.fingerprint,
+                status: '失败',
+                checkedAt: new Date().toISOString(),
+                model: settings.ai.model,
+                excerpt: result.aiExcerpt || '',
+                rates: parseFxRates(settings.currency.rates),
+                error: aiResult.error,
+                previousData: previousAiExtraction
+            });
         }
         return result;
     }
@@ -842,6 +906,23 @@
     function getHeader(headers, name) {
         const match = String(headers || '').match(new RegExp(`^${name}:\\s*(.+)$`, 'im'));
         return match ? match[1].trim() : '';
+    }
+
+    function getResponseText(response) {
+        if (!response || typeof response !== 'object') return '';
+        const text = typeof response.responseText === 'string' ? response.responseText : '';
+        if (text) return text;
+        if (typeof response.response === 'string') return response.response;
+        const body = response.response;
+        try {
+            if (typeof TextDecoder !== 'undefined' && body instanceof ArrayBuffer) {
+                return new TextDecoder('utf-8').decode(new Uint8Array(body));
+            }
+            if (typeof TextDecoder !== 'undefined' && ArrayBuffer.isView(body)) {
+                return new TextDecoder('utf-8').decode(body);
+            }
+        } catch {}
+        return '';
     }
 
     function getSourceProbeRule(url) {
@@ -904,8 +985,10 @@
                 return;
             }
             const headers = { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' };
-            if (previous?.etag) headers['If-None-Match'] = previous.etag;
-            if (previous?.lastModified) headers['If-Modified-Since'] = previous.lastModified;
+            if (!requestOptions.forceFresh) {
+                if (previous?.etag) headers['If-None-Match'] = previous.etag;
+                if (previous?.lastModified) headers['If-Modified-Since'] = previous.lastModified;
+            }
 
             GM_xmlhttpRequest({
                 method: 'GET',
@@ -914,11 +997,16 @@
                 anonymous: true,
                 headers,
                 onload: res => {
-                    const raw = String(res.responseText || '');
+                    const raw = getResponseText(res);
                     const title = (raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
                     const body = sanitizeProbeText(normalizeProbeText(raw));
                     const status = Number(res.status) || 0;
                     if (status === 304) {
+                        const previousText = sanitizeProbeText(previous?.snapshotText || '');
+                        if (previousText.length < 180 && !requestOptions.forceFresh) {
+                            requestUpdateCheck(url, previous, { ...requestOptions, forceFresh: true }).then(resolve);
+                            return;
+                        }
                         resolve({
                             ok: true, status, statusText: res.statusText || '',
                             fingerprint: previous?.fingerprint || '',
@@ -930,7 +1018,9 @@
                             extractFacts: previous?.extractFacts || null,
                             aiExtraction: previous?.aiExtraction || null,
                             aiStatus: previous?.aiStatus || '',
-                            checkedAt: new Date().toISOString(), changed: false, notModified: true, error: ''
+                            weak: previousText.length < 180,
+                            checkedAt: new Date().toISOString(), changed: false, notModified: true,
+                            error: previousText.length < 180 ? '服务器返回 304，但缓存正文仍不足' : ''
                         });
                         return;
                     }
@@ -947,7 +1037,9 @@
                         extractFacts: extractDeterministicFacts(body, url),
                         weak: body.length < 180 || looksLikeDynamicShell(raw, body),
                         checkedAt: new Date().toISOString(),
-                        error: status >= 200 && status < 400 ? '' : `HTTP ${status}`
+                        error: status >= 200 && status < 400
+                            ? (raw ? '' : `HTTP ${status}，响应正文为空`)
+                            : `HTTP ${status}`
                     });
                 },
                 onerror: () => resolve({ ok: false, status: 0, error: '网络错误或拒绝连接' }),
@@ -1113,6 +1205,14 @@
             if (fallbackRes.ok) result = fallbackRes;
         }
 
+        // 手动 AI 复核必须以这次重新抓到的结果为准，不能把上次 AI 结果混进本次失败状态。
+        if (requestOptions.forceAi) {
+            result.aiExtraction = null;
+            result.aiStatus = '';
+            result.aiCheckedAt = '';
+            result.aiModel = '';
+        }
+
         result.probeMode = result.rendered ? 'rendered' : rule.mode;
         if (result.snapshotText) {
             result.snapshotText = sanitizeProbeText(result.snapshotText).slice(0, MAX_PROBE_BYTES);
@@ -1122,13 +1222,38 @@
         result.changed = Boolean(!result.weak && previous?.fingerprint && previous.fingerprint !== result.fingerprint);
         result.sourceUrl = url;
         result.compareAvailable = Boolean(!result.weak && previous?.fingerprint && result.fingerprint);
-        if (!result.aiExtraction && previous && !result.changed) {
+        const previousAiExtraction = previous?.aiExtraction || previous?.previousAiExtraction || null;
+        if (!requestOptions.forceAi && !result.aiExtraction && previous && !result.changed && !result.weak) {
             result.aiExtraction = previous.aiExtraction || null;
+            result.previousAiExtraction = previous.previousAiExtraction || null;
             result.aiStatus = previous.aiStatus || '';
             result.aiCheckedAt = previous.aiCheckedAt || '';
             result.aiModel = previous.aiModel || '';
+        } else if (!requestOptions.forceAi && previous && (result.changed || result.weak)) {
+            result.aiExtraction = null;
+            result.previousAiExtraction = previousAiExtraction;
+            result.aiCheckedAt = '';
+            result.aiModel = '';
+            result.aiStatus = result.changed
+                ? 'AI未复核：正文发生变化'
+                : 'AI未复核：本次正文过短或疑似动态壳';
+            saveAiSnapshot(url, {
+                fingerprint: result.fingerprint,
+                status: '未复核',
+                checkedAt: new Date().toISOString(),
+                excerpt: result.aiExcerpt || '',
+                rates: parseFxRates(readAppSettings().currency.rates),
+                error: result.aiStatus,
+                previousData: previousAiExtraction
+            });
         }
-        result = await maybeRunAiExtraction(url, result, previous, Boolean(requestOptions.forceAi));
+        result = await maybeRunAiExtraction(
+            url,
+            result,
+            previous,
+            Boolean(requestOptions.forceAi),
+            Boolean(requestOptions.skipAutoAi)
+        );
         if (result.ok && (!result.weak || !previous)) {
             result.previousCheckedAt = previous?.checkedAt || '';
             GM_setValue(sourceKey(url), result);
@@ -1136,19 +1261,24 @@
         }
         if (result.ok && result.weak && previous) {
             const retained = { ...previous };
+            const aiAttemptNeedsReview = /^AI(?:失败|未执行|未复核)/.test(String(result.aiStatus || ''));
             retained.lastError = result.error || '本次正文不足，保留上次可比较记录';
             retained.lastAttemptAt = new Date().toISOString();
             retained.aiStatus = result.aiStatus || retained.aiStatus || '';
-            retained.aiExtraction = result.aiExtraction || retained.aiExtraction || null;
-            retained.aiCheckedAt = result.aiCheckedAt || retained.aiCheckedAt || '';
-            retained.aiModel = result.aiModel || retained.aiModel || '';
+            retained.previousAiExtraction = aiAttemptNeedsReview
+                ? (result.previousAiExtraction || retained.aiExtraction || retained.previousAiExtraction || null)
+                : (result.previousAiExtraction || retained.previousAiExtraction || null);
+            retained.aiExtraction = aiAttemptNeedsReview ? null : (result.aiExtraction || retained.aiExtraction || null);
+            retained.aiCheckedAt = aiAttemptNeedsReview ? '' : (result.aiCheckedAt || retained.aiCheckedAt || '');
+            retained.aiModel = aiAttemptNeedsReview ? '' : (result.aiModel || retained.aiModel || '');
             retained.currentProbe = {
                 ok: result.ok,
                 weak: true,
                 uncomparable: Boolean(result.uncomparable),
                 error: result.error || '',
                 aiStatus: result.aiStatus || '',
-                aiExtraction: result.aiExtraction || null,
+                aiExtraction: aiAttemptNeedsReview ? null : (result.aiExtraction || null),
+                previousAiExtraction: result.previousAiExtraction || null,
                 checkedAt: result.checkedAt || ''
             };
             GM_setValue(sourceKey(url), retained);
@@ -1158,17 +1288,22 @@
                 attemptError: retained.lastError,
                 uncomparable: Boolean(result.uncomparable),
                 aiStatus: result.aiStatus || retained.aiStatus || '',
-                aiExtraction: result.aiExtraction || retained.aiExtraction || null,
+                aiExtraction: aiAttemptNeedsReview ? null : (result.aiExtraction || retained.aiExtraction || null),
+                previousAiExtraction: result.previousAiExtraction || retained.previousAiExtraction || null,
                 currentProbe: retained.currentProbe
             };
         }
         const retained = previous ? { ...previous } : {};
+        const aiAttemptNeedsReview = /^AI(?:失败|未执行|未复核)/.test(String(result.aiStatus || ''));
         retained.lastError = result.error || '检查失败';
         retained.lastAttemptAt = new Date().toISOString();
         retained.aiStatus = result.aiStatus || retained.aiStatus || '';
-        retained.aiExtraction = result.aiExtraction || retained.aiExtraction || null;
-        retained.aiCheckedAt = result.aiCheckedAt || retained.aiCheckedAt || '';
-        retained.aiModel = result.aiModel || retained.aiModel || '';
+        retained.previousAiExtraction = aiAttemptNeedsReview
+            ? (result.previousAiExtraction || retained.aiExtraction || retained.previousAiExtraction || null)
+            : (result.previousAiExtraction || retained.previousAiExtraction || null);
+        retained.aiExtraction = aiAttemptNeedsReview ? null : (result.aiExtraction || retained.aiExtraction || null);
+        retained.aiCheckedAt = aiAttemptNeedsReview ? '' : (result.aiCheckedAt || retained.aiCheckedAt || '');
+        retained.aiModel = aiAttemptNeedsReview ? '' : (result.aiModel || retained.aiModel || '');
         GM_setValue(sourceKey(url), retained);
         return {
             ...retained,
@@ -1179,14 +1314,17 @@
     }
 
     function probeSummary(probe) {
+        const aiReview = getAiReviewState(probe);
+        const aiNotice = aiReview.kind === 'action' ? '；建议点击 AI 复核' : '';
         if (probe?.attemptFailed && probe.ok) {
             return { label: `本次失败：${probe.attemptError}；保留 ${formatDate(probe.checkedAt)} 记录`, color: '#e3b341' };
         }
         if (!probe) return { label: '未检查', color: '#8b949e' };
         if (!probe.ok) return { label: '失败：' + (probe.error || '未知错误'), color: '#f85149' };
-        if (probe.uncomparable) return { label: probe.error || '页面可访问；动态渲染，未取得可比较正文', color: '#e3b341' };
-        if (probe.changed) return { label: `页面发生更新（${formatDate(probe.checkedAt)}）`, color: '#e3b341' };
-        if (probe.weak) return { label: `内容过短（${formatDate(probe.checkedAt)}）`, color: '#e3b341' };
+        if (probe.uncomparable) return { label: (probe.error || '页面可访问；动态渲染，未取得可比较正文') + aiNotice, color: '#e3b341' };
+        if (probe.error && Number(probe.textLength || 0) === 0) return { label: probe.error + '（' + formatDate(probe.checkedAt) + '）', color: '#e3b341' };
+        if (probe.changed) return { label: `页面发生更新（${formatDate(probe.checkedAt)}）` + aiNotice, color: '#e3b341' };
+        if (probe.weak) return { label: `内容过短（${formatDate(probe.checkedAt)}）` + aiNotice, color: '#e3b341' };
         const len = Number(probe.textLength || probe.bytes || 0).toLocaleString();
         const facts = probe.extractFacts && probe.extractFacts.signals && probe.extractFacts.signals.length
             ? '；' + probe.extractFacts.signals.join('，')
@@ -1222,6 +1360,62 @@
         if (data.confidence) pieces.push('置信度 ' + data.confidence);
         if (warnings) pieces.push('注意 ' + warnings);
         return pieces.join('；') || '已取得结构化结果，待人工确认';
+    }
+
+    function formatProviderAiStatus(snapshot) {
+        if (!snapshot) return '';
+        const status = String(snapshot.status || '').trim();
+        if (snapshot.data) {
+            const label = status && status !== '待人工确认' ? '最近 AI 结果（' + status + '）' : '最近 AI 待人工确认';
+            return label + '：' + formatAiSnapshot(snapshot);
+        }
+        if (status === '失败' || status === '未执行' || status === '未复核') {
+            const cleanError = String(snapshot.error || '')
+                .replace(/^AI(?:失败|未执行|未复核)\s*[:：]?\s*/i, '')
+                .trim();
+            const reason = cleanError ? '：' + cleanError : '';
+            const previous = snapshot.previousData
+                ? '；上次成功结果：' + formatAiSnapshot({ data: snapshot.previousData })
+                : '';
+            return '最近 AI ' + status + reason + previous;
+        }
+        return '';
+    }
+
+    function getAiReviewState(probe) {
+        if (!probe) return { kind: 'none', label: 'AI复核：可选（尚未检查）', color: '#8b949e' };
+        if (!probe.ok) return { kind: 'unavailable', label: 'AI复核：暂不可执行（请先解决来源抓取失败）', color: '#f85149' };
+        const status = String(probe.aiStatus || '').trim();
+        if (/^AI(?:失败|未执行)/.test(status)) {
+            const reason = /正文过短|正文不足/.test(status)
+                ? '正文不足，无法分析'
+                : (/(?:未启用|Key|Endpoint)/i.test(status) ? '需先配置 AI' : '可重试');
+            return { kind: 'unavailable', label: 'AI复核：未完成（' + reason + '）', color: '#f85149' };
+        }
+        if (probe.aiExtraction) {
+            return { kind: 'done', label: 'AI复核：已完成，结果待人工确认', color: '#3fb950' };
+        }
+        if (Number(probe.textLength || 0) < 120) {
+            return { kind: 'unavailable', label: 'AI复核：暂不可执行（可供 AI 分析的正文不足 120 字）', color: '#f85149' };
+        }
+        const facts = probe.extractFacts || {};
+        if (probe.changed || probe.weak || probe.uncomparable || !Array.isArray(facts.signals) || !facts.signals.length || /^AI未复核/.test(status)) {
+            const ai = readAppSettings().ai || {};
+            if (!ai.enabled || !String(ai.apiKey || '').trim() || !isHttpUrl(ai.endpoint)) {
+                return { kind: 'unavailable', label: 'AI复核：建议复核，但需先在厂商配置中启用 AI 并填写 Key', color: '#e3b341' };
+            }
+            return { kind: 'action', label: 'AI复核：建议点击（页面有变化或正文不完整）', color: '#e3b341' };
+        }
+        return { kind: 'optional', label: 'AI复核：可选（当前正文未变化）', color: '#8b949e' };
+    }
+
+    function applyAiReviewButtonState(button, probe) {
+        if (!button) return;
+        const state = getAiReviewState(probe);
+        const action = state.kind === 'action';
+        button.textContent = action ? '建议 AI复核' : 'AI重新抓取复核';
+        button.title = state.label + '；点击后会重新抓取正文';
+        button.style.borderColor = action ? '#d29922' : '';
     }
 
     function getProviderAiSnapshot(provider) {
@@ -1300,9 +1494,14 @@
             return escapeHtml(item.raw || (currencySymbol(item.currency) + item.amount))
                 + (Number.isFinite(displayAmount) ? '≈' + escapeHtml(currencySymbol(displayCode) + displayAmount.toFixed(2)) : (Number.isFinite(cny) ? '≈' + escapeHtml(formatCny(cny)) : '（未换算）'));
         }).join('、') : '';
-        const ai = probe.aiExtraction
-            ? 'AI：' + escapeHtml(formatAiSnapshot({ data: probe.aiExtraction }))
-            : (probe.aiStatus ? 'AI：' + escapeHtml(probe.aiStatus) : 'AI：未复核');
+        const aiNeedsReview = /^AI(?:失败|未执行|未复核)/.test(String(probe.aiStatus || ''));
+        const aiReview = getAiReviewState(probe);
+        const previousAi = probe.previousAiExtraction || null;
+        const ai = aiNeedsReview
+            ? 'AI：' + escapeHtml(probe.aiStatus) + (previousAi ? '；上次 AI 结果：' + escapeHtml(formatAiSnapshot({ data: previousAi })) : '')
+            : (probe.aiExtraction
+                ? 'AI：' + escapeHtml(formatAiSnapshot({ data: probe.aiExtraction }))
+                : (probe.aiStatus ? 'AI：' + escapeHtml(probe.aiStatus) : 'AI：未复核'));
         const aiEvidence = probe.aiExtraction && Array.isArray(probe.aiExtraction.prices)
             ? probe.aiExtraction.prices.slice(0, 3).map(item => String(item.plan || '未标注套餐') + '：“' + String(item.evidence || '无原文证据') + '”').join('；')
             : '';
@@ -1311,11 +1510,18 @@
             facts.inferredCurrency && facts.inferredCurrency !== 'UNKNOWN' ? '页面推断币种 ' + facts.inferredCurrency : '页面币种未明确',
             priceFacts ? '价格 ' + priceFacts : ''
         ].filter(Boolean).join('；');
+        const probeError = probe.error || probe.attemptError || probe.lastError || '';
+        const textLength = Number(probe.textLength || 0);
         const rendered = probe.uncomparable
             ? '页面可访问，但未取得可比较正文'
-            : (probe.rendered ? '动态渲染正文已保存' : 'HTTP 正文已保存');
+            : probeError
+                ? ((probe.rendered ? '动态渲染异常：' : 'HTTP正文异常：') + probeError)
+                : textLength === 0
+                    ? (probe.rendered ? '动态渲染未取得正文' : 'HTTP响应正文为空')
+                    : (probe.rendered ? '动态渲染正文已保存' : 'HTTP 正文已保存');
         return '<div class="llm-muted" data-source-details>' + escapeHtml(rendered) + '；' + escapeHtml(factsText || '暂未识别结构化价格') + '；' + ai
             + (aiEvidence ? '<br>AI原文证据：' + escapeHtml(aiEvidence) : '')
+            + '<br><span data-ai-review-status style="color:' + aiReview.color + ';">' + escapeHtml(aiReview.label) + '</span>'
             + '<br><span style="word-break:break-all;">证据来源：' + escapeHtml(url || probe.sourceUrl || '') + '</span></div>';
     }
 
@@ -1517,6 +1723,7 @@
             const updateLinks = getUsableLinks(p, 'updates');
             const kw = [p.name, p.models, p.category, p.tag, p.plans, p.promos, p.traps].join(' ');
             const aiSnapshot = getProviderAiSnapshot(p);
+            const aiSnapshotText = formatProviderAiStatus(aiSnapshot);
             html += `
                 <div class="llm-card" data-kw="${escapeHtml(kw)}">
                     <div class="llm-card-header">
@@ -1534,7 +1741,7 @@
                     <div class="llm-highlight-promo">🎁 <strong>活动优惠：</strong>${escapeHtml(p.promos)}</div>
                     <div style="font-size: 11px; color: var(--llm-red); margin-bottom: 6px;">⚠️ <strong>避坑提示：</strong>${escapeHtml(p.traps)}</div>
                     <div class="llm-muted">官方数据核验：${escapeHtml(p.verifiedAt)}</div>
-                    ${aiSnapshot ? '<div class="llm-highlight-promo">🤖 最近 AI 待人工确认：' + escapeHtml(formatAiSnapshot(aiSnapshot)) + '</div>' : ''}
+                    ${aiSnapshotText ? '<div class="llm-highlight-promo">🤖 ' + escapeHtml(aiSnapshotText) + '</div>' : ''}
                     <div class="llm-card-links">
                         ${pricingLinks.map(l => `<a href="${safeHref(l.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip">💳 ${escapeHtml(l.title)}</a>`).join('')}
                         ${updateLinks.map(l => `<a href="${safeHref(l.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip" style="background: rgba(35,134,54,0.18); color: #3fb950;">📢 ${escapeHtml(l.title)}</a>`).join('')}
@@ -1558,17 +1765,17 @@
         const providers = getEnabledProviders();
         let html = `
             <div style="display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;">
-                <button class="llm-btn" id="llm-probe-all" title="依次联网检查全部启用的定价与更新来源">① 检查全部来源</button>
-                <button class="llm-btn" id="llm-probe-pricing" title="只联网检查定价/套餐来源，不检查更新公告">② 仅检查定价</button>
-                <button class="llm-btn" id="llm-radar-refresh" title="只重新渲染本地已保存状态，不发起网络请求">③ 重新读取本地状态</button>
+                <button class="llm-btn" id="llm-probe-all" title="依次联网抓取全部启用的定价与更新来源，不自动调用 AI">① 全量抓取检查</button>
+                <button class="llm-btn" id="llm-probe-pricing" title="只联网抓取定价/套餐来源，不检查更新公告，也不自动调用 AI">② 仅抓取定价</button>
+                <button class="llm-btn" id="llm-radar-refresh" title="只重新渲染本地已保存状态，不发起网络请求">③ 刷新本地状态</button>
             </div>
             <div class="llm-card" style="margin-bottom: 12px;">
                 <div style="font-size: 12px; line-height: 1.7;">
                     <strong>雷达操作说明</strong><br>
-                    ① <strong>检查全部来源</strong>：逐个打开官方页面并采集正文；适合完整巡检，速度较慢。<br>
-                    ② <strong>仅检查定价</strong>：只检查价格/套餐链接；适合优先核对成本。<br>
-                    ③ <strong>重新读取本地状态</strong>：不联网，只把已保存的检查结果重新显示。每条来源的“检查”是普通采集，“AI复核”是在采集正文后送到你配置的模型进行结构化整理。<br>
-                    <span class="llm-muted">绿色表示已取得正文；黄色表示首次动态页面尚无历史可比、检测到变化或需要人工确认；红色表示本次请求失败。AI 结果只作证据辅助，不会自动覆盖厂商主数据。</span>
+                    ① <strong>全量抓取检查</strong>：逐个抓取所有定价和更新来源；适合完整巡检，速度较慢，不自动调用 AI。<br>
+                    ② <strong>仅抓取定价</strong>：只抓取价格/套餐来源；适合优先核对成本，不自动调用 AI。<br>
+                    ③ <strong>刷新本地状态</strong>：不联网，只重新显示已保存结果。每条来源的“抓取检查”默认只采集；打开配置中的自动开关后，首次、正文变化或正文过短才会自动调用 AI；“AI重新抓取复核”会强制重新取正文并尝试调用 AI，不需要先点“抓取检查”。未启用 AI 或未填 Key 时会明确显示未执行。<br>
+                    <span class="llm-muted">AI 复核状态会单独提示：黄色“建议点击”=建议复核但不是强制；灰色“可选”=当前无需重复点；绿色“已完成”=本次已有 AI 结果；红色“未完成/暂不可执行”=先处理抓取或 AI 配置。AI 结果只作证据辅助，不会自动覆盖厂商主数据。</span>
                 </div>
             </div>
         `;
@@ -1578,6 +1785,9 @@
                 const last = GM_getValue(key, '未读');
                 const lastProbe = GM_getValue(sourceKey(up.url), null);
                 const summary = probeSummary(lastProbe);
+                const aiReviewState = getAiReviewState(lastProbe);
+                const aiButtonLabel = aiReviewState.kind === 'action' ? '建议 AI复核' : 'AI重新抓取复核';
+                const aiButtonStyle = aiReviewState.kind === 'action' ? ' style="border-color:#d29922;"' : '';
                 html += `
                     <div class="llm-settings-row" data-source-card="${escapeHtml(up.url)}">
                         <div style="display: flex; justify-content: space-between; gap: 10px; align-items: flex-start;">
@@ -1585,11 +1795,12 @@
                                 <div style="font-size: 13px;"><strong style="color: #58a6ff;">[${escapeHtml(p.name)}]</strong> <span class="llm-muted">${up.kind === 'pricing' ? '定价' : '更新'}</span> ${escapeHtml(up.title)}</div>
                                 <div style="font-size: 11px; color: var(--llm-text-dim); margin-top: 3px;">上次打开：${escapeHtml(last)}</div>
                                 <div class="llm-source-status" data-source-status style="color: ${summary.color};">来源检查：${escapeHtml(summary.label)}</div>
+                                <div class="llm-source-status" data-ai-review-state style="color: ${aiReviewState.color};">${escapeHtml(aiReviewState.label)}</div>
                             </div>
                             <div style="display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end;">
-                                <button class="llm-btn llm-probe-one" data-url="${safeHref(up.url)}" data-kind="${up.kind}" title="获取页面正文并比较历史指纹">检查</button>
-                                <button class="llm-btn llm-ai-one" data-url="${safeHref(up.url)}" data-kind="${up.kind}" title="重新获取正文并调用已配置的 AI 抽取">AI复核</button>
-                                <a href="${safeHref(up.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip track-read" data-key="${escapeHtml(key)}" style="font-size: 12px; padding: 5px 10px;">打开来源 ↗</a>
+                                <button class="llm-btn llm-probe-one" data-url="${safeHref(up.url)}" data-kind="${up.kind}" title="抓取页面正文并比较历史指纹；默认不调用 AI，自动开关开启后按条件调用">抓取检查</button>
+                                <button class="llm-btn llm-ai-one" data-url="${safeHref(up.url)}" data-kind="${up.kind}" title="${escapeHtml(aiReviewState.label)}；点击后会重新抓取正文"${aiButtonStyle}>${aiButtonLabel}</button>
+                                <a href="${safeHref(up.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip track-read" data-key="${escapeHtml(key)}" style="font-size: 12px; padding: 5px 10px;">打开官方来源 ↗</a>
                             </div>
                         </div>
                         ${formatProbeDetails(lastProbe, up.url)}
@@ -1605,18 +1816,33 @@
             });
         });
 
-        const checkOne = async (button, forceAi = false) => {
+        const checkOne = async (button, forceAi = false, skipAutoAi = false) => {
             const url = button.getAttribute('data-url');
             const card = button.closest('[data-source-card]');
             const status = card?.querySelector('[data-source-status]');
+            const aiReviewStatus = card?.querySelector('[data-ai-review-state]');
             const details = card?.querySelector('[data-source-details]');
+            const actionName = forceAi ? 'AI复核' : '抓取检查';
             button.disabled = true;
-            if (status) { status.textContent = '来源检查：检查中…'; status.style.color = '#e3b341'; }
-            const result = await probeSource(url, { forceAi });
-            const next = probeSummary(result);
-            if (status) { status.textContent = '来源检查：' + next.label; status.style.color = next.color; }
-            if (details) details.outerHTML = formatProbeDetails(result, url);
-            button.disabled = false;
+            if (status) { status.textContent = '来源检查：' + actionName + '中…'; status.style.color = '#e3b341'; }
+            try {
+                const result = await probeSource(url, {
+                    forceAi,
+                    forceFresh: forceAi,
+                    skipAutoAi
+                });
+                const next = probeSummary(result);
+                const nextAiReviewState = getAiReviewState(result);
+                if (status) { status.textContent = '来源检查：' + next.label; status.style.color = next.color; }
+                if (aiReviewStatus) { aiReviewStatus.textContent = nextAiReviewState.label; aiReviewStatus.style.color = nextAiReviewState.color; }
+                applyAiReviewButtonState(card?.querySelector('.llm-ai-one'), result);
+                if (details) details.outerHTML = formatProbeDetails(result, url);
+            } catch (error) {
+                const message = error && error.message ? error.message : String(error || '未知错误');
+                if (status) { status.textContent = actionName + '失败：' + message; status.style.color = '#f85149'; }
+            } finally {
+                button.disabled = false;
+            }
         };
 
         bodyContent.querySelectorAll('.llm-probe-one').forEach(btn => {
@@ -1628,23 +1854,24 @@
         });
 
         const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-        bodyContent.querySelector('#llm-probe-all').addEventListener('click', async e => {
-            e.currentTarget.disabled = true;
-            for (const btn of bodyContent.querySelectorAll('.llm-probe-one')) {
-                await checkOne(btn);
-                await sleep(350);
+        const runBatch = async (button, selector) => {
+            button.disabled = true;
+            try {
+                for (const btn of bodyContent.querySelectorAll(selector)) {
+                    await checkOne(btn, false, true);
+                    await sleep(350);
+                }
+            } finally {
+                button.disabled = false;
             }
-            e.currentTarget.disabled = false;
+        };
+
+        bodyContent.querySelector('#llm-probe-all').addEventListener('click', e => {
+            runBatch(e.currentTarget, '.llm-probe-one');
         });
 
-        bodyContent.querySelector('#llm-probe-pricing').addEventListener('click', async e => {
-            e.currentTarget.disabled = true;
-            for (const btn of bodyContent.querySelectorAll('.llm-probe-one[data-kind="pricing"]')) {
-                await checkOne(btn);
-                await sleep(350);
-            }
-            e.currentTarget.disabled = false;
+        bodyContent.querySelector('#llm-probe-pricing').addEventListener('click', e => {
+            runBatch(e.currentTarget, '.llm-probe-one[data-kind="pricing"]');
         });
 
         bodyContent.querySelector('#llm-radar-refresh').addEventListener('click', renderRadar);
@@ -1747,11 +1974,11 @@
             const targetB = current.targetB;
             const coverage = targetB > 0 ? Math.min(1, knownCapacity / targetB) : 0;
             const gapB = Math.max(0, targetB - knownCapacity);
-            const fallbackCost = gapB * apiCostPerB;
             const pureApiCost = targetB * apiCostPerB;
             const hasUnknownPrice = unknownPriceCount > 0;
             const hasUnknownCapacity = unknownCapacityCount > 0;
-            const effectiveCost = hasUnknownPrice ? NaN : subscriptionCost + fallbackCost;
+            const fallbackCost = hasUnknownCapacity ? NaN : gapB * apiCostPerB;
+            const effectiveCost = hasUnknownPrice || hasUnknownCapacity ? NaN : subscriptionCost + fallbackCost;
             const savings = Number.isFinite(effectiveCost) ? pureApiCost - effectiveCost : NaN;
             const selectedHtml = selected.length ? selected.map(item => {
                 const capText = Number.isFinite(item.capacity) ? (item.capacity * item.quantity).toFixed(2) + 'B' : '未知（未计入已知容量）';
@@ -1759,10 +1986,12 @@
                 return '<div class="llm-rank-item"><div><strong>' + escapeHtml(item.provider.name) + ' · ' + escapeHtml(item.row.plan) + '</strong><div class="llm-muted">' + item.quantity + ' 个账号；计入容量 ' + escapeHtml(capText) + '；订阅费 ' + escapeHtml(priceText) + '</div></div><div class="llm-muted" style="text-align:right;">' + escapeHtml(item.row.bottleneck) + '</div></div>';
             }).join('') : '<div class="llm-card">购物车为空。请在上方勾选账号并设置数量。</div>';
             const warnings = [];
-            if (hasUnknownCapacity) warnings.push('有 ' + unknownCapacityCount + ' 个账号的 Token/额度容量未知，达成率和 API 缺口只按已知容量计算，不自动估算');
+            if (hasUnknownCapacity) warnings.push('有 ' + unknownCapacityCount + ' 个账号的 Token/额度容量未知，达成率仅显示已知容量下界；API 缺口和总成本暂不闭合');
             if (hasUnknownPrice) warnings.push('有 ' + unknownPriceCount + ' 个账号没有可换算价格，总成本暂不闭合；请更新脚本内的价格基准');
             if (current.apiMode === 'custom' && current.customApiCost <= 0) warnings.push('你选择了自定义 API 单价，但当前是 0；请填写真实的 ¥/B Token');
             if (selected.some(item => item.row.capacityMode === 'official-credit')) warnings.push('MiMo 当前官方口径是 Credits，不一定等于裸 Token；建议用你的实际账单/实测值覆盖容量');
+            const capacityGapText = hasUnknownCapacity ? '待定（有未知容量）' : gapB.toFixed(2) + 'B';
+            const fallbackCostText = hasUnknownCapacity ? '待定（有未知容量）' : formatCny(fallbackCost);
             const costText = Number.isFinite(effectiveCost) ? formatCny(effectiveCost) : '待定';
             const savingsText = Number.isFinite(savings) ? formatCny(savings) + '（' + (pureApiCost > 0 ? (savings / pureApiCost * 100).toFixed(1) : '0.0') + '%）' : '待定';
             document.getElementById('llm-calc-summary').innerHTML = [
@@ -1770,10 +1999,10 @@
                 '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">',
                 '<div><div class="llm-muted">已选账号</div><strong>' + totalAccounts + ' 个</strong></div>',
                 '<div><div class="llm-muted">已知容量合计</div><strong>' + knownCapacity.toFixed(2) + 'B</strong></div>',
-                '<div><div class="llm-muted">目标达成率</div><strong>' + (coverage * 100).toFixed(1) + '%</strong></div>',
-                '<div><div class="llm-muted">已知容量缺口</div><strong>' + gapB.toFixed(2) + 'B</strong></div>',
+                '<div><div class="llm-muted">' + (hasUnknownCapacity ? '已知容量达成率（下界）' : '目标达成率') + '</div><strong>' + (coverage * 100).toFixed(1) + '%</strong></div>',
+                '<div><div class="llm-muted">已知容量缺口</div><strong>' + escapeHtml(capacityGapText) + '</strong></div>',
                 '<div><div class="llm-muted">订阅月费（已知价格）</div><strong>' + formatCny(subscriptionCost) + '</strong></div>',
-                '<div><div class="llm-muted">API 兜底缺口成本</div><strong>' + formatCny(fallbackCost) + '</strong></div>',
+                '<div><div class="llm-muted">API 兜底缺口成本</div><strong>' + escapeHtml(fallbackCostText) + '</strong></div>',
                 '<div><div class="llm-muted">购物车有效月成本</div><strong>' + escapeHtml(costText) + '</strong></div>',
                 '<div><div class="llm-muted">纯 API 基准</div><strong>' + formatCny(pureApiCost) + '</strong></div>',
                 '<div><div class="llm-muted">相对纯 API 节省</div><strong>' + escapeHtml(savingsText) + '</strong></div>',
@@ -1786,6 +2015,7 @@
         };
 
         bodyContent.querySelectorAll('input, select').forEach(element => {
+            if (element.getAttribute('data-cart-check') !== null) return;
             element.addEventListener('input', recalculate);
             element.addEventListener('change', recalculate);
         });
@@ -1819,12 +2049,12 @@
             '</div>',
             '<div class="llm-settings-row">',
             '<div style="font-size:13px;font-weight:600;">AI 页面抽取（可选）</div>',
-            '<div class="llm-muted" style="margin-top:4px;line-height:1.6;">用于动态页面、正文结构变化或普通抽取不完整时的辅助整理。Endpoint 需兼容 OpenAI Chat Completions；Key 只写入当前浏览器的油猴本地存储，不会写入脚本或 Git。</div>',
+            '<div class="llm-muted" style="margin-top:4px;line-height:1.6;">用于动态页面、正文结构变化或普通抽取不完整时的辅助整理。Endpoint 需兼容 OpenAI Chat Completions；Key 只写入当前浏览器的 Tampermonkey 本地存储，不会写入脚本或 Git。普通“抓取检查”只有勾选下面的自动开关才会按条件调用 AI；顶部批量按钮永远只抓取，不调用 AI。</div>',
             '<label class="llm-settings-label"><input type="checkbox" data-ai-enabled ' + (app.ai.enabled ? 'checked' : '') + ' /> 启用 AI 抽取</label>',
             '<label class="llm-settings-label">Endpoint</label><input type="text" data-ai-endpoint value="' + escapeHtml(app.ai.endpoint) + '" />',
             '<label class="llm-settings-label">模型名</label><input type="text" data-ai-model value="' + escapeHtml(app.ai.model) + '" />',
             '<label class="llm-settings-label">API Key（本地保存）</label><input type="password" data-ai-key value="' + escapeHtml(app.ai.apiKey) + '" autocomplete="off" />',
-            '<label class="llm-settings-label"><input type="checkbox" data-ai-first-check ' + (app.ai.runOnFirstCheck ? 'checked' : '') + ' /> 首次检查或正文过短时自动调用 AI（会产生 API 费用）</label>',
+            '<label class="llm-settings-label"><input type="checkbox" data-ai-first-check ' + (app.ai.runOnFirstCheck ? 'checked' : '') + ' /> 普通“抓取检查”遇到首次抓取、正文变化或正文过短时自动调用 AI（会产生 API 费用）</label>',
             '<label class="llm-settings-label">送入 AI 的最大正文字符数</label><input type="number" data-ai-max-chars min="3000" max="' + MAX_AI_EXCERPT_CHARS + '" step="500" value="' + Number(app.ai.maxExcerptChars || 14000) + '" />',
             '</div>',
             '<div class="llm-settings-row">',
@@ -1832,6 +2062,10 @@
             '<div class="llm-muted" style="margin-top:4px;line-height:1.6;">金额保留来源原币种；下方汇率仅用于换算人民币。格式为“外币代码=人民币金额”，例如 USD=7.20。国外页面没有明确币种时显示待确认，不会根据 IP 猜测。</div>',
             '<label class="llm-settings-label">来源显示币种（购物车测算统一用 CNY）</label><select data-currency-display>' + currencyOptions + '</select>',
             '<label class="llm-settings-label">汇率（1 外币 = 多少 CNY）</label><textarea data-currency-rates>' + escapeHtml(app.currency.rates) + '</textarea>',
+            '</div>',
+            '<div class="llm-card">',
+            '<div style="font-size:13px;font-weight:600;margin-bottom:6px;">配置与数据保存位置</div>',
+            '<div class="llm-muted" style="line-height:1.7;">配置通过 Tampermonkey 的 GM_setValue/GM_getValue 保存于当前浏览器、当前用户的油猴脚本存储中；不会写入此脚本文件、网页 localStorage、Git 或项目目录。主要配置包括 AI/汇率（<code>llm_app_settings_v1</code>）、厂商开关和来源地址（<code>llm_provider_settings_v2</code>）、购物车（<code>llm_calc_cart_v1</code>）。抓取正文和 AI 结果也保存在同一位置，用于下次比较。API Key 虽不写入仓库，但这里不是独立密码保险箱；清理 Tampermonkey 数据、卸载脚本或更换浏览器后可能丢失。恢复初始默认只清除配置和购物车，不代表清除所有历史抓取缓存。</div>',
             '</div>',
             '<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">',
             '<button class="llm-btn" id="llm-save-settings">保存全部配置</button>',
@@ -1886,6 +2120,7 @@
         });
 
         bodyContent.querySelector('#llm-reset-settings').addEventListener('click', () => {
+            if (!window.confirm('恢复初始默认会清除 API Key、厂商地址、开关、汇率和购物车设置，确定继续吗？')) return;
             saveProviderSettings({});
             saveAppSettings(DEFAULT_APP_SETTINGS);
             saveCalcCart({ targetB: 20, nightPercent: 40, apiMode: API_COST_PROFILES[0].id, customApiCost: 0, quantities: {} });
