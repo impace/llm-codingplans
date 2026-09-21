@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.7.8
+// @version      2.7.9
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -227,7 +227,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.7.8';
+    const APP_VERSION = '2.7.9';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -512,6 +512,149 @@
             checkedAt: new Date().toISOString(),
             ...extra
         };
+    }
+
+    function getAiModelsEndpoint(endpoint) {
+        try {
+            const parsed = new URL(String(endpoint || ''));
+            if (/\/chat\/completions\/?$/i.test(parsed.pathname)) {
+                parsed.pathname = parsed.pathname.replace(/\/chat\/completions\/?$/i, '/models');
+            } else if (/\/responses\/?$/i.test(parsed.pathname)) {
+                parsed.pathname = parsed.pathname.replace(/\/responses\/?$/i, '/models');
+            } else {
+                parsed.pathname = '/v1/models';
+            }
+            parsed.search = '';
+            parsed.hash = '';
+            return parsed.href;
+        } catch {
+            return '';
+        }
+    }
+
+    function requestAiTestStep({ method, endpoint, model, apiKey, timeout, phase, data }) {
+        return new Promise(resolve => {
+            const startedAt = Date.now();
+            const headers = {};
+            if (data !== undefined) headers['Content-Type'] = 'application/json';
+            if (String(apiKey || '').trim()) headers.Authorization = 'Bearer ' + String(apiKey).trim();
+            GM_xmlhttpRequest({
+                method,
+                url: endpoint,
+                timeout,
+                anonymous: true,
+                headers,
+                ...(data !== undefined ? { data: JSON.stringify(data) } : {}),
+                onload: response => {
+                    const responseText = String(response.responseText || '');
+                    const diagnostics = buildAiDiagnostics(endpoint, model, phase, {
+                        httpStatus: Number(response.status) || 0,
+                        contentType: getHeader(response.responseHeaders, 'content-type'),
+                        requestId: getHeader(response.responseHeaders, 'x-request-id')
+                            || getHeader(response.responseHeaders, 'openai-request-id')
+                            || getHeader(response.responseHeaders, 'request-id')
+                            || getHeader(response.responseHeaders, 'cf-ray'),
+                        responseBytes: responseText.length,
+                        elapsedMs: Date.now() - startedAt
+                    });
+                    const ok = Number(response.status) >= 200 && Number(response.status) < 300;
+                    resolve({
+                        ok,
+                        status: Number(response.status) || 0,
+                        responseText,
+                        error: ok ? '' : summarizeAiResponse(responseText),
+                        diagnostics
+                    });
+                },
+                onerror: error => resolve({
+                    ok: false,
+                    status: 0,
+                    responseText: '',
+                    error: '网络请求失败：' + sanitizeAiDiagnosticText(error?.error || error?.message || '未取得 HTTP 响应'),
+                    diagnostics: buildAiDiagnostics(endpoint, model, phase + '网络错误', { elapsedMs: Date.now() - startedAt })
+                }),
+                ontimeout: () => resolve({
+                    ok: false,
+                    status: 0,
+                    responseText: '',
+                    error: '请求超时（' + Math.round(timeout / 1000) + '秒）',
+                    diagnostics: buildAiDiagnostics(endpoint, model, phase + '超时', { elapsedMs: Date.now() - startedAt })
+                })
+            });
+        });
+    }
+
+    async function testAiConnection(config) {
+        const endpoint = String(config?.endpoint || '').trim();
+        const model = String(config?.model || '').trim();
+        const apiKey = String(config?.apiKey || '').trim();
+        if (!isHttpUrl(endpoint)) return { ok: false, validationError: 'Endpoint 不是有效的 HTTP(S) 地址' };
+        if (!model) return { ok: false, validationError: '请填写模型名' };
+        if (!apiKey) return { ok: false, validationError: '请填写 API Key' };
+
+        const modelsEndpoint = getAiModelsEndpoint(endpoint);
+        const models = await requestAiTestStep({
+            method: 'GET',
+            endpoint: modelsEndpoint,
+            model,
+            apiKey,
+            timeout: 10000,
+            phase: '模型列表检查'
+        });
+        models.modelIds = [];
+        models.targetListed = null;
+        if (models.ok) {
+            try {
+                const payload = JSON.parse(models.responseText || '{}');
+                const rows = Array.isArray(payload.data) ? payload.data : (Array.isArray(payload.models) ? payload.models : []);
+                models.modelIds = rows.map(item => String(item?.id || item?.name || '')).filter(Boolean);
+                if (models.modelIds.length) models.targetListed = models.modelIds.includes(model);
+            } catch {
+                models.parseWarning = '模型列表返回成功，但不是可识别的 JSON 格式';
+            }
+        }
+
+        if (models.status === 401 || models.status === 403) {
+            return { ok: false, models, chat: null, stoppedAfterModels: true };
+        }
+
+        const chat = await requestAiTestStep({
+            method: 'POST',
+            endpoint,
+            model,
+            apiKey,
+            timeout: 30000,
+            phase: '短消息测试',
+            data: {
+                model,
+                temperature: 0,
+                max_tokens: 8,
+                stream: false,
+                messages: [
+                    { role: 'system', content: '严格按用户要求，只输出最短答案。' },
+                    { role: 'user', content: '只回复两个大写字母：OK' }
+                ]
+            }
+        });
+        if (chat.ok) {
+            try {
+                const payload = JSON.parse(chat.responseText || '{}');
+                const rawContent = payload?.choices?.[0]?.message?.content || payload?.output_text || '';
+                chat.content = Array.isArray(rawContent)
+                    ? rawContent.map(part => typeof part === 'string' ? part : (part?.text || '')).join('')
+                    : String(rawContent || '');
+                if (!chat.content.trim()) {
+                    chat.ok = false;
+                    chat.error = 'HTTP 成功，但没有找到兼容的模型输出字段';
+                    chat.diagnostics.phase = '短消息响应解析';
+                }
+            } catch {
+                chat.ok = false;
+                chat.error = 'HTTP 成功，但响应不是有效 JSON';
+                chat.diagnostics.phase = '短消息响应解析';
+            }
+        }
+        return { ok: chat.ok, models, chat, stoppedAfterModels: false };
     }
 
     function saveAiSnapshot(url, snapshot) {
@@ -1715,10 +1858,11 @@
     function explainAiDiagnostics(diagnostics) {
         if (!diagnostics || typeof diagnostics !== 'object') return '';
         const status = Number(diagnostics.httpStatus) || 0;
-        if (diagnostics.phase === '请求前校验') return '请求未发送：请先解决正文完整性问题';
-        if (diagnostics.phase === '配置检查') return '请求未发送：请检查 AI 开关、API Key 与 Endpoint';
-        if (diagnostics.phase === '网络错误') return '请求未取得 HTTP 响应：检查网络、代理、DNS、跨域连接策略或接口可达性';
-        if (diagnostics.phase === '请求超时') return '接口在 30 秒内没有完成响应：可稍后重试或检查服务状态';
+        const phase = String(diagnostics.phase || '');
+        if (phase === '请求前校验') return '请求未发送：请先解决正文完整性问题';
+        if (phase === '配置检查') return '请求未发送：请检查 AI 开关、API Key 与 Endpoint';
+        if (/网络错误$/.test(phase)) return '请求未取得 HTTP 响应：检查网络、代理、DNS、跨域连接策略或接口可达性';
+        if (/超时$/.test(phase)) return '接口在限定时间内没有完成响应：可稍后重试或检查服务状态';
         if (status === 400) return '请求已到达接口：通常是模型名、请求字段或接口格式不兼容';
         if (status === 401) return '请求已到达接口：通常是 API Key 无效、过期或 Authorization 格式不对';
         if (status === 403) return '请求已到达接口：通常是账号权限、模型权限、地区/IP 或接口策略限制';
@@ -2469,6 +2613,11 @@
             '<label class="llm-settings-label">API Key（本地保存）</label><input type="password" data-ai-key value="' + escapeHtml(app.ai.apiKey) + '" autocomplete="off" />',
             '<label class="llm-settings-label"><input type="checkbox" data-ai-first-check ' + (app.ai.runOnFirstCheck ? 'checked' : '') + ' /> 普通“抓取检查”在首次取得完整正文或完整正文发生变化时自动调用 AI（会产生 API 费用）</label>',
             '<label class="llm-settings-label">送入 AI 的最大正文字符数</label><input type="number" data-ai-max-chars min="3000" max="' + MAX_AI_EXCERPT_CHARS + '" step="500" value="' + Number(app.ai.maxExcerptChars || 14000) + '" />',
+            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;">',
+            '<button type="button" class="llm-btn" id="llm-test-ai">测试 AI 接口</button>',
+            '<span class="llm-muted">先检查连接、Key 和模型列表，再发送一个最多 8 tokens 的“OK”短请求；使用当前输入框内容，无需先保存，可能产生极少量 API 费用。</span>',
+            '</div>',
+            '<div id="llm-ai-test-result" class="llm-muted" style="margin-top:8px;line-height:1.7;"></div>',
             '</div>',
             '<div class="llm-settings-row">',
             '<div style="font-size:13px;font-weight:600;">币种与汇率</div>',
@@ -2500,6 +2649,75 @@
             ].join('');
         });
         bodyContent.innerHTML = html;
+
+        bodyContent.querySelector('#llm-test-ai').addEventListener('click', async event => {
+            const button = event.currentTarget;
+            const resultBox = bodyContent.querySelector('#llm-ai-test-result');
+            const endpoint = bodyContent.querySelector('[data-ai-endpoint]').value.trim();
+            const model = bodyContent.querySelector('[data-ai-model]').value.trim();
+            const apiKey = bodyContent.querySelector('[data-ai-key]').value.trim();
+            button.disabled = true;
+            button.textContent = '测试中…';
+            resultBox.innerHTML = '<span style="color:#e3b341;">正在检查模型列表与认证…</span>';
+            try {
+                const result = await testAiConnection({ endpoint, model, apiKey });
+                if (result.validationError) {
+                    resultBox.innerHTML = '<span style="color:#f85149;">测试未执行：' + escapeHtml(result.validationError) + '</span>';
+                    return;
+                }
+                const lines = [];
+                const models = result.models;
+                if (models) {
+                    const modelsDiagnostic = formatAiDiagnostics(models.diagnostics);
+                    if (models.ok) {
+                        lines.push('<span style="color:#3fb950;">① 网关连接与认证成功</span>：' + escapeHtml(modelsDiagnostic));
+                        if (models.targetListed === true) {
+                            lines.push('<span style="color:#3fb950;">模型列表中存在 ' + escapeHtml(model) + '</span>');
+                        } else if (models.targetListed === false) {
+                            lines.push('<span style="color:#e3b341;">模型列表中未找到 ' + escapeHtml(model) + '</span>；请核对模型名。');
+                        } else if (models.parseWarning) {
+                            lines.push('<span style="color:#e3b341;">' + escapeHtml(models.parseWarning) + '</span>');
+                        } else {
+                            lines.push('<span style="color:#e3b341;">模型列表为空，无法确认模型名；继续进行短消息测试。</span>');
+                        }
+                    } else {
+                        const advice = explainAiDiagnostics(models.diagnostics);
+                        lines.push('<span style="color:#f85149;">① 模型列表检查失败：' + escapeHtml(models.error || '未知错误') + '</span>');
+                        lines.push('诊断：' + escapeHtml(modelsDiagnostic));
+                        if (advice) lines.push('初步判断：' + escapeHtml(advice));
+                    }
+                }
+                const chat = result.chat;
+                if (chat) {
+                    const chatDiagnostic = formatAiDiagnostics(chat.diagnostics);
+                    if (chat.ok) {
+                        lines.push('<span style="color:#3fb950;">② 短消息测试成功</span>：模型返回“' + escapeHtml(sanitizeAiDiagnosticText(chat.content, 80)) + '”；' + escapeHtml(chatDiagnostic));
+                        lines.push('<strong style="color:#3fb950;">结论：Endpoint、API Key 和模型路由均可用。此前长正文超时更可能是处理时间超过 30 秒。</strong>');
+                    } else {
+                        const advice = explainAiDiagnostics(chat.diagnostics);
+                        lines.push('<span style="color:#f85149;">② 短消息测试失败：' + escapeHtml(chat.error || '未知错误') + '</span>');
+                        lines.push('诊断：' + escapeHtml(chatDiagnostic));
+                        if (advice) lines.push('初步判断：' + escapeHtml(advice));
+                        if (chat.status === 0 && /超时/.test(String(chat.diagnostics?.phase || ''))) {
+                            const gatewayConclusion = models?.ok
+                                ? '网关连接和认证正常，但极短请求仍超时'
+                                : '模型列表检查未成功，且极短请求也超时';
+                            lines.push('<strong style="color:#f85149;">结论：' + gatewayConclusion + '；重点检查 ' + escapeHtml(model) + ' 的上游路由、账号状态、网络可达性和代理日志。</strong>');
+                        } else {
+                            lines.push('<strong style="color:#f85149;">结论：接口未通过完整短请求测试，请按上面的 HTTP 状态和错误摘要处理。</strong>');
+                        }
+                    }
+                } else if (result.stoppedAfterModels) {
+                    lines.push('<strong style="color:#f85149;">结论：认证或权限检查失败，未继续发送模型请求。</strong>');
+                }
+                resultBox.innerHTML = lines.join('<br>');
+            } catch (error) {
+                resultBox.innerHTML = '<span style="color:#f85149;">测试脚本异常：' + escapeHtml(error?.message || String(error || '未知错误')) + '</span>';
+            } finally {
+                button.disabled = false;
+                button.textContent = '测试 AI 接口';
+            }
+        });
 
         bodyContent.querySelector('#llm-save-settings').addEventListener('click', () => {
             const providerSettings = readProviderSettings();
