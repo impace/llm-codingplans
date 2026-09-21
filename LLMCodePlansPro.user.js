@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.8.0
+// @version      2.9.1
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -227,7 +227,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.8.0';
+    const APP_VERSION = '2.9.1';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -237,6 +237,11 @@
     const SETTINGS_SCHEMA_VERSION = 3;
     const MAX_PROBE_BYTES = 500000;
     const MAX_AI_EXCERPT_CHARS = 18000;
+    const REQUEST_TOKEN_SCENARIOS = {
+        conservative: 8000,
+        baseline: 32000,
+        optimistic: 100000
+    };
 
     const DEFAULT_APP_SETTINGS = {
         ai: {
@@ -1000,6 +1005,9 @@
             '金额必须保留页面原始币种；如果页面没有明确币种，返回 UNKNOWN，不要根据访问者IP猜币种。',
             '同时根据给定汇率计算 amountCny；汇率仅用于换算，不改变原始金额。',
             '页面正文可能包含导航、营销文案、重复内容；请优先使用套餐表、价格表、额度表。',
+            '额度的 value 与 unit 必须共同保留数量级：例如 100M Tokens 返回 value=100、unit="M tokens"，11B Tokens 返回 value=11、unit="B tokens"；不要把 M/B 丢掉。',
+            'window 必须保留原始周期并尽量标准化为 monthly、weekly、daily、5h 等；同一套餐有月度和滚动窗口双重限制时，两项都要返回。',
+            'Credits、积分、请求数和消息数不能猜测为 Token；分别使用 credits、points、requests、messages 等单位。',
             '必须只返回 JSON，不要 Markdown 代码围栏。JSON 字段：',
             JSON.stringify({
                 confidence: 'high|medium|low',
@@ -1007,7 +1015,7 @@
                 changeSummary: '本次页面变化的简短说明',
                 pageCurrency: 'USD|EUR|GBP|JPY|CNY|HKD|KRW|UNKNOWN',
                 prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', amountCny: 0, evidence: '原文短证据' }],
-                quotas: [{ plan: '套餐名', value: 0, unit: 'requests|tokens|credits|unknown', window: '5h|weekly|monthly|unknown', evidence: '原文短证据' }],
+                quotas: [{ plan: '套餐名', value: 0, unit: 'tokens|K tokens|M tokens|B tokens|requests|messages|credits|points|unknown', window: '5h|daily|weekly|monthly|unknown', evidence: '原文短证据' }],
                 models: ['正文明确提及的模型'],
                 warnings: ['币种、地区、登录态或页面不确定性']
             }),
@@ -1946,23 +1954,28 @@
         const diagnosticAdvice = explainAiDiagnostics(diagnostics);
         const aiStatus = String(displayProbe.aiStatus || '').trim();
         const snapshotStatus = String(snapshot?.status || '').trim();
-        const aiError = String(aiStatus || snapshot?.error || '').trim();
-        const cleanAiError = aiError.replace(/^AI失败\s*[:：]?\s*/, '');
-        const aiFailed = /^AI失败/.test(aiStatus) || snapshotStatus === '失败';
+        const effectiveStatus = aiStatus || snapshotStatus;
+        const aiFailed = /^AI失败/.test(aiStatus) || (!aiStatus && snapshotStatus === '失败');
+        const aiNotExecuted = /^AI未执行/.test(aiStatus) || (!aiStatus && snapshotStatus === '未执行');
+        const failureText = aiFailed
+            ? String(/^AI失败/.test(aiStatus) ? aiStatus.replace(/^AI失败\s*[:：]?\s*/, '') : (snapshot?.error || '')).trim()
+            : '';
+        const stateText = aiFailed ? '' : effectiveStatus;
         const parts = [];
         if (displayProbe.aiExtraction) {
             const label = displayProbe.aiReused || displayProbe.notModified ? '同一正文版本的历史 AI 结果：' : '本次 AI 结果：';
             parts.push(label + escapeHtml(formatAiSnapshot({ data: displayProbe.aiExtraction })));
         }
-        if (aiFailed && cleanAiError) {
-            parts.push('<span style="color:#f85149;">AI错误：' + escapeHtml(cleanAiError) + '</span>');
-        } else if (/^AI未执行/.test(aiError) && diagnosticText) {
-            parts.push('AI状态：' + escapeHtml(aiError));
+        if (aiFailed && failureText) {
+            parts.push('<span style="color:#f85149;">AI错误：' + escapeHtml(failureText) + '</span>');
+        } else if (aiNotExecuted && stateText && diagnosticText) {
+            parts.push('AI状态：' + escapeHtml(stateText));
         }
         if (diagnosticText) {
             const copyText = 'AI诊断：' + diagnosticText
                 + (diagnosticAdvice ? '\n初步判断：' + diagnosticAdvice : '')
-                + (cleanAiError ? '\nAI错误：' + cleanAiError : '');
+                + (stateText ? '\nAI状态：' + stateText : '')
+                + (failureText ? '\nAI错误：' + failureText : '');
             parts.push('AI诊断：' + escapeHtml(diagnosticText) + ' <button type="button" class="llm-btn llm-copy-ai-diagnostics" data-ai-diagnostics="' + escapeHtml(copyText) + '" style="font-size:11px;padding:2px 7px;">复制 AI 诊断</button>');
             if (diagnosticAdvice) parts.push('初步判断：' + escapeHtml(diagnosticAdvice));
         }
@@ -2011,6 +2024,242 @@
         const snapshots = links.map(link => GM_getValue(aiSnapshotKey(link.url), null)).filter(Boolean);
         snapshots.sort((a, b) => String(b.checkedAt || '').localeCompare(String(a.checkedAt || '')));
         return snapshots[0] || null;
+    }
+
+    function normalizePlanKey(value) {
+        return String(value || '')
+            .toLowerCase()
+            .replace(/\+/g, ' plus ')
+            .replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
+            .trim();
+    }
+
+    function planMatches(left, right) {
+        const a = normalizePlanKey(left);
+        const b = normalizePlanKey(right);
+        if (!a || !b || a === '未标注套餐' || b === '未标注套餐') return false;
+        if (a === b) return true;
+        const tierWords = new Set(['free', 'go', 'lite', 'essential', 'standard', 'pro', 'plus', 'max', 'heavy', 'ultra', 'team']);
+        const tiersOf = value => value.split(/\s+/).filter(word => tierWords.has(word)).join(' ');
+        const aTiers = tiersOf(a);
+        const bTiers = tiersOf(b);
+        if (aTiers !== bTiers && (aTiers || bTiers)) return false;
+        if (a.length >= 3 && b.includes(a)) return true;
+        if (b.length >= 3 && a.includes(b)) return true;
+        const aWords = a.split(/\s+/).filter(word => word.length >= 2);
+        const bWords = new Set(b.split(/\s+/));
+        return aWords.some(word => bWords.has(word));
+    }
+
+    function monthlyMultiplier(windowValue) {
+        const value = String(windowValue || '').trim().toLowerCase();
+        if (!value || value === 'unknown') return NaN;
+        if (/month|monthly|月/.test(value)) return 1;
+        if (/week|weekly|周|7\s*(?:d|day|天)/.test(value)) return 52 / 12;
+        if (/day|daily|日|天/.test(value)) return 365 / 12;
+        if (/year|yearly|annual|年/.test(value)) return 1 / 12;
+        const hours = value.match(/([0-9]+(?:\.[0-9]+)?)\s*(?:h|hour|小时)/);
+        if (hours) return (365 * 24 / 12) / Number(hours[1]);
+        const days = value.match(/([0-9]+(?:\.[0-9]+)?)\s*(?:d|day|天)/);
+        if (days) return (365 / 12) / Number(days[1]);
+        return NaN;
+    }
+
+    function quotaUnitKind(unit) {
+        const value = String(unit || '').trim().toLowerCase();
+        if (/b\s*token|billion|十亿/.test(value)) return 'b-tokens';
+        if (/m\s*token|million|百万/.test(value)) return 'm-tokens';
+        if (/k\s*token|thousand|千/.test(value)) return 'k-tokens';
+        if (/token/.test(value)) return 'tokens';
+        if (/request|call|message|次|请求|消息/.test(value)) return 'requests';
+        if (/credit|point|积分|点数|额度点/.test(value)) return 'credits';
+        return 'unknown';
+    }
+
+    function parseQuotaValue(value, unit) {
+        if (typeof value === 'number') return { value, unit: String(unit || '') };
+        const raw = String(value || '').replace(/,/g, '').trim();
+        const match = raw.match(/^([0-9]+(?:\.[0-9]+)?)\s*([KMB])?$/i);
+        if (!match) return { value: NaN, unit: String(unit || '') };
+        const numericValue = Number(match[1]);
+        const suffix = String(match[2] || '').toUpperCase();
+        let normalizedUnit = String(unit || '');
+        if (suffix && /token/i.test(normalizedUnit) && !/\b[KMB]\s*token/i.test(normalizedUnit)) {
+            normalizedUnit = suffix + ' tokens';
+        }
+        return { value: numericValue, unit: normalizedUnit };
+    }
+
+    function tokenValueToB(value, kind) {
+        const amount = Number(value);
+        if (!Number.isFinite(amount) || amount < 0) return NaN;
+        if (kind === 'b-tokens') return amount;
+        if (kind === 'm-tokens') return amount / 1000;
+        if (kind === 'k-tokens') return amount / 1000000;
+        if (kind === 'tokens') return amount / 1000000000;
+        return NaN;
+    }
+
+    function collectProviderAiData(provider) {
+        const links = [...getUsableLinks(provider, 'pricing'), ...getUsableLinks(provider, 'updates')];
+        return links
+            .map(link => {
+                const snapshot = GM_getValue(aiSnapshotKey(link.url), null);
+                const data = snapshot?.data || snapshot?.previousData || null;
+                return { link, snapshot, data, historical: Boolean(!snapshot?.data && snapshot?.previousData) };
+            })
+            .filter(item => item.data)
+            .sort((a, b) => String(b.snapshot.checkedAt || '').localeCompare(String(a.snapshot.checkedAt || '')));
+    }
+
+    function deriveQuotaCapacity(row, provider) {
+        const candidates = collectProviderAiData(provider);
+        const exact = [];
+        const requests = [];
+        const relative = [];
+        candidates.forEach(({ link, snapshot, data, historical }) => {
+            const quotas = Array.isArray(data?.quotas) ? data.quotas : [];
+            quotas.forEach(quota => {
+                if (!planMatches(row.plan, quota.plan)) return;
+                const parsedQuota = parseQuotaValue(quota.value, quota.unit);
+                const value = parsedQuota.value;
+                if (!Number.isFinite(value) || value < 0) return;
+                const multiplier = monthlyMultiplier(quota.window);
+                const kind = quotaUnitKind(parsedQuota.unit);
+                const source = {
+                    value,
+                    unit: String(parsedQuota.unit || 'unknown'),
+                    window: String(quota.window || 'unknown'),
+                    evidence: String(quota.evidence || ''),
+                    sourceUrl: link.url,
+                    checkedAt: snapshot.checkedAt || '',
+                    confidence: String(data?.confidence || 'low'),
+                    historical
+                };
+                if (kind.endsWith('tokens') && Number.isFinite(multiplier)) {
+                    const monthlyB = tokenValueToB(value, kind) * multiplier;
+                    if (Number.isFinite(monthlyB)) exact.push({ ...source, monthlyB });
+                } else if (kind === 'requests' && Number.isFinite(multiplier)) {
+                    const monthlyRequests = value * multiplier;
+                    requests.push({ ...source, monthlyRequests });
+                } else if (kind === 'credits') {
+                    relative.push(source);
+                }
+            });
+        });
+        // 同一套餐可能同时存在月度上限与滚动窗口上限，取折算后更严格的约束。
+        exact.sort((a, b) => a.monthlyB - b.monthlyB);
+        requests.sort((a, b) => a.monthlyRequests - b.monthlyRequests);
+        if (exact.length) {
+            const item = exact[0];
+            return {
+                kind: 'official-token',
+                minB: item.monthlyB,
+                baseB: item.monthlyB,
+                maxB: item.monthlyB,
+                confidence: item.confidence === 'high' ? 'high' : 'medium',
+                label: '官方 Token 月容量 ' + item.monthlyB.toFixed(2) + 'B',
+                evidence: (item.historical ? '沿用上次成功 AI 结果；' : '') + (item.evidence || (item.value + ' ' + item.unit + '/' + item.window)),
+                sourceUrl: item.sourceUrl,
+                checkedAt: item.checkedAt
+            };
+        }
+        const builtin = Number(row.capacityB);
+        const hasBuiltin = row.capacityB !== null && row.capacityB !== '' && Number.isFinite(builtin) && builtin >= 0;
+        if (hasBuiltin) {
+            return {
+                kind: row.capacityMode === 'official-token' ? 'official-token' : 'builtin-credit',
+                minB: builtin,
+                baseB: builtin,
+                maxB: builtin,
+                confidence: row.capacityMode === 'official-token' ? 'high' : 'medium',
+                label: '内置基准 ' + builtin.toFixed(2) + 'B',
+                evidence: row.evidence,
+                sourceUrl: '',
+                checkedAt: ''
+            };
+        }
+        if (requests.length) {
+            const item = requests[0];
+            const toB = tokens => item.monthlyRequests * tokens / 1000000000;
+            return {
+                kind: 'estimated-requests',
+                minB: toB(REQUEST_TOKEN_SCENARIOS.conservative),
+                baseB: toB(REQUEST_TOKEN_SCENARIOS.baseline),
+                maxB: toB(REQUEST_TOKEN_SCENARIOS.optimistic),
+                confidence: 'low',
+                label: '按 ' + Math.round(item.monthlyRequests).toLocaleString() + ' 次/月自动估算',
+                evidence: (item.historical ? '沿用上次成功 AI 结果；' : '') + (item.evidence || (item.value + ' ' + item.unit + '/' + item.window)),
+                sourceUrl: item.sourceUrl,
+                checkedAt: item.checkedAt
+            };
+        }
+        if (relative.length) {
+            const item = relative[0];
+            return {
+                kind: 'relative-credit',
+                minB: NaN,
+                baseB: NaN,
+                maxB: NaN,
+                confidence: 'relative',
+                label: item.value.toLocaleString() + ' ' + item.unit + '/' + item.window + '（无官方 Token 换算）',
+                evidence: (item.historical ? '沿用上次成功 AI 结果；' : '') + item.evidence,
+                sourceUrl: item.sourceUrl,
+                checkedAt: item.checkedAt
+            };
+        }
+        const requestMatch = String(row.bottleneck || '').match(/([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:次|请求|messages?)\s*\/\s*(月|周|7\s*天|天)/i);
+        if (requestMatch) {
+            const value = Number(requestMatch[1].replace(/,/g, ''));
+            const multiplier = monthlyMultiplier(requestMatch[2]);
+            const monthlyRequests = value * multiplier;
+            const toB = tokens => monthlyRequests * tokens / 1000000000;
+            return {
+                kind: 'estimated-requests',
+                minB: toB(REQUEST_TOKEN_SCENARIOS.conservative),
+                baseB: toB(REQUEST_TOKEN_SCENARIOS.baseline),
+                maxB: toB(REQUEST_TOKEN_SCENARIOS.optimistic),
+                confidence: 'low',
+                label: '按内置官方额度 ' + Math.round(monthlyRequests).toLocaleString() + ' 次/月自动估算',
+                evidence: row.bottleneck,
+                sourceUrl: '',
+                checkedAt: ''
+            };
+        }
+        const relativeMatch = String(row.bottleneck || '').match(/([0-9][0-9,]*(?:\.[0-9]+)?)\s*(Credits?|积分|点数)\s*\/\s*(月|周|7\s*天|天)/i);
+        if (relativeMatch) {
+            return {
+                kind: 'relative-credit',
+                minB: NaN,
+                baseB: NaN,
+                maxB: NaN,
+                confidence: 'relative',
+                label: Number(relativeMatch[1].replace(/,/g, '')).toLocaleString() + ' ' + relativeMatch[2] + '/' + relativeMatch[3] + '（无官方 Token 换算）',
+                evidence: row.bottleneck,
+                sourceUrl: '',
+                checkedAt: ''
+            };
+        }
+        return {
+            kind: 'unavailable',
+            minB: NaN,
+            baseB: NaN,
+            maxB: NaN,
+            confidence: 'unknown',
+            label: '尚无可折算 Token 数据',
+            evidence: row.evidence || row.bottleneck,
+            sourceUrl: '',
+            checkedAt: ''
+        };
+    }
+
+    function buildCapacityProfiles(rows, providers) {
+        const result = new Map();
+        rows.forEach(row => {
+            const provider = providers.get(row.providerId) || { id: row.providerId, links: {} };
+            result.set(row.id, deriveQuotaCapacity(row, provider));
+        });
+        return result;
     }
 
     function formatCny(value) {
@@ -2155,8 +2404,14 @@
             display: flex; align-items: center; justify-content: center;
             color: #ffffff; cursor: grab; z-index: 999998;
             user-select: none; touch-action: none;
-            transition: box-shadow 0.2s ease, transform 0.1s ease;
+            transition: box-shadow 0.2s ease, transform 0.22s ease, opacity 0.22s ease;
         }
+        #llm-floater.llm-docked-left { left: 0 !important; right: auto !important; }
+        #llm-floater.llm-docked-right { left: calc(100vw - 48px) !important; right: auto !important; }
+        #llm-floater.llm-docked-left.llm-edge-hidden { transform: translateX(-30px); opacity: 0.72; }
+        #llm-floater.llm-docked-right.llm-edge-hidden { transform: translateX(30px); opacity: 0.72; }
+        #llm-floater.llm-edge-hidden:hover,
+        #llm-floater.llm-edge-hidden:focus-visible { transform: translateX(0); opacity: 1; }
         #llm-floater:active { cursor: grabbing; transform: scale(0.96); }
         #llm-floater svg { width: 24px; height: 24px; pointer-events: none; }
         #llm-modal {
@@ -2274,6 +2529,28 @@
     floater.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 0 1 10 10c0 5.52-4.48 10-10 10S2 17.52 2 12 6.48 2 12 2z"></path><path d="m9 12 2 2 4-4"></path></svg>`;
     document.body.appendChild(floater);
 
+    const FLOATER_EDGE_GAP = 18;
+    let floaterDockSide = '';
+
+    function setFloaterDock(side, hidden = true) {
+        floaterDockSide = side === 'left' || side === 'right' ? side : '';
+        floater.classList.toggle('llm-docked-left', floaterDockSide === 'left');
+        floater.classList.toggle('llm-docked-right', floaterDockSide === 'right');
+        floater.classList.toggle('llm-edge-hidden', Boolean(floaterDockSide && hidden));
+    }
+
+    function dockFloater(left, top, persist = true) {
+        const maxTop = Math.max(FLOATER_EDGE_GAP, window.innerHeight - floater.offsetHeight - FLOATER_EDGE_GAP);
+        const clampedTop = Math.max(FLOATER_EDGE_GAP, Math.min(maxTop, Number(top) || FLOATER_EDGE_GAP));
+        const side = Number(left) + floater.offsetWidth / 2 < window.innerWidth / 2 ? 'left' : 'right';
+        floater.style.right = 'auto';
+        floater.style.bottom = 'auto';
+        floater.style.top = clampedTop + 'px';
+        floater.style.left = side === 'left' ? '0px' : Math.max(0, window.innerWidth - floater.offsetWidth) + 'px';
+        setFloaterDock(side, true);
+        if (persist) GM_setValue('llm_floater_pos', { left: side === 'left' ? 0 : window.innerWidth - floater.offsetWidth, top: clampedTop, dock: side });
+    }
+
     const savedPos = GM_getValue('llm_floater_pos', null);
     if (savedPos && typeof savedPos.left === 'number' && typeof savedPos.top === 'number') {
         const clampX = Math.max(10, Math.min(window.innerWidth - 58, savedPos.left));
@@ -2285,6 +2562,10 @@
         floater.style.bottom = '75px';
     }
 
+    if (savedPos && (savedPos.dock === 'left' || savedPos.dock === 'right')) {
+        dockFloater(savedPos.left, savedPos.top, false);
+    }
+
     const modal = document.createElement('div');
     modal.id = 'llm-modal';
     modal.innerHTML = `
@@ -2294,7 +2575,7 @@
                 <span class="llm-badge-version">v${APP_VERSION}</span>
             </div>
             <div class="llm-actions">
-                <button class="llm-btn-icon" id="llm-btn-close" title="关闭">✕</button>
+                <button type="button" class="llm-btn-icon" id="llm-btn-close" title="关闭" aria-label="关闭窗口">✕</button>
             </div>
         </div>
         <div class="llm-tabs">
@@ -2503,6 +2784,7 @@
         const cart = readCalcCart();
         const rows = getCartRows();
         const providers = new Map(getAllProviders().map(provider => [provider.id, provider]));
+        const capacityProfiles = buildCapacityProfiles(rows, providers);
         const apiOptions = API_COST_PROFILES.map(profile => '<option value="' + escapeHtml(profile.id) + '"' + (cart.apiMode === profile.id ? ' selected' : '') + '>' + escapeHtml(profile.name) + '</option>').join('');
         const formatDefaultPrice = row => {
             const price = getAccountPrice(row, rates);
@@ -2512,11 +2794,24 @@
         const rowHtml = rows.map(row => {
             const provider = providers.get(row.providerId) || { name: row.providerId };
             const quantity = Math.floor(Math.max(0, Number(cart.quantities[row.id]) || 0));
-            const hasCapacity = row.capacityB !== null && row.capacityB !== undefined && row.capacityB !== '' && Number.isFinite(Number(row.capacityB));
-            const defaultCapacity = hasCapacity ? Number(row.capacityB).toFixed(2) + 'B' : '未知';
+            const capacity = capacityProfiles.get(row.id);
+            const hasCapacity = Number.isFinite(capacity?.baseB);
+            const defaultCapacity = hasCapacity
+                ? (capacity.kind === 'estimated-requests'
+                    ? capacity.baseB.toFixed(2) + 'B（' + capacity.minB.toFixed(2) + '～' + capacity.maxB.toFixed(2) + 'B）'
+                    : capacity.baseB.toFixed(2) + 'B')
+                : (capacity?.kind === 'relative-credit' ? '不可折算 B' : '暂无数据');
             const baselinePrice = getAccountPrice(row, rates);
-            const unitCost = Number.isFinite(baselinePrice.cny) && Number(row.capacityB) > 0 ? '；约 ¥' + (baselinePrice.cny / Number(row.capacityB)).toFixed(2) + '/B' : '';
-            const modeLabel = row.capacityMode === 'official-credit' ? '官方 Credits（标称 B，口径需核实）' : (row.capacityMode === 'official-token' ? '官方计量值' : 'Token 容量未知');
+            const unitCost = Number.isFinite(baselinePrice.cny) && Number(capacity?.baseB) > 0 ? '；基准约 ¥' + (baselinePrice.cny / capacity.baseB).toFixed(2) + '/B' : '';
+            const modeLabel = capacity?.kind === 'official-token'
+                ? '官方 Token 月容量'
+                : capacity?.kind === 'estimated-requests'
+                    ? '请求次数自动估算（8K / 32K / 100K Token/次）'
+                    : capacity?.kind === 'relative-credit'
+                        ? '官方 Credits/积分，无公开 Token 换算'
+                        : capacity?.kind === 'builtin-credit'
+                            ? '内置官方标称 B，口径需核实'
+                            : '尚无可折算容量';
             return [
                 '<div class="llm-settings-row" data-cart-row="' + escapeHtml(row.id) + '">',
                 '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">',
@@ -2525,10 +2820,10 @@
                 escapeHtml(provider.name) + ' · ' + escapeHtml(row.plan),
                 '<span class="llm-muted" style="margin-left:6px;">' + formatDefaultPrice(row) + '</span>',
                 '</label>',
-                '<span class="llm-muted" style="text-align:right;">单账号上限：' + escapeHtml(defaultCapacity + unitCost) + '</span>',
+                '<span class="llm-muted" style="text-align:right;">单账号容量：' + escapeHtml(defaultCapacity + unitCost) + '</span>',
                 '</div>',
                 '<div class="llm-muted" style="margin-top:8px;">购买数量 <input class="llm-input-num" style="width:76px;" type="number" min="0" step="1" data-cart-quantity value="' + quantity + '" /> 个；' + escapeHtml(modeLabel) + '；短板：' + escapeHtml(row.bottleneck) + '</div>',
-                '<div class="llm-muted" style="margin-top:3px;">证据口径：' + escapeHtml(row.evidence) + '</div>',
+                '<div class="llm-muted" style="margin-top:3px;">自动容量依据：' + escapeHtml(capacity?.label || '暂无') + '；证据：' + escapeHtml(capacity?.evidence || row.evidence) + (capacity?.checkedAt ? '；更新于 ' + escapeHtml(formatDate(capacity.checkedAt)) : '') + '</div>',
                 '</div>'
             ].join('');
         }).join('');
@@ -2536,7 +2831,7 @@
         bodyContent.innerHTML = [
             '<div class="llm-calc-box">',
             '<div style="font-weight:600;margin-bottom:10px;font-size:14px;">🧮 单账号极限基准 + 自选购物车大盘</div>',
-            '<div class="llm-muted" style="line-height:1.7;">这里只需要勾选账号并填写购买数量。系统按脚本内的单账号基准汇总你的选择，不替你自动挑选、分配或补账号。未知容量保持未知，不纳入已知容量统计；未知价格显示为待定。</div>',
+            '<div class="llm-muted" style="line-height:1.7;">这里只需要勾选账号并填写购买数量。系统自动读取雷达/AI 的最新官方额度：明确 Token 值直接按周期换算；请求次数按统一编码负载生成保守、基准、乐观区间；Credits/积分没有官方换算公式时保留为相对额度，不伪造 Token。</div>',
             '<div class="llm-muted" style="line-height:1.7;margin-top:6px;">操作：每行勾选 = 纳入购物车，购买数量 = 买几个。上面的目标月用量（默认 20B）只是大盘对比目标；API 兜底基准只用于缺口和纯 API 参考，不是账号购买数量。</div>',
             '<div class="llm-input-group" style="margin-top:12px;"><span>目标月用量：</span><span><input type="number" id="calc-target-b" class="llm-input-num" min="0.01" step="0.1" value="' + cart.targetB + '" /> B Token</span></div>',
             '<div class="llm-input-group"><span>闲时/夜间占比：</span><span><input type="number" id="calc-night-percent" class="llm-input-num" min="0" max="100" step="1" value="' + cart.nightPercent + '" /> %</span></div>',
@@ -2576,59 +2871,71 @@
             let subscriptionCost = 0;
             let unknownPriceCount = 0;
             let unknownCapacityCount = 0;
-            let knownCapacity = 0;
+            let relativeCapacityCount = 0;
+            let conservativeCapacity = 0;
+            let baselineCapacity = 0;
+            let optimisticCapacity = 0;
             rows.forEach(row => {
                 const quantity = Math.floor(Math.max(0, Number(current.quantities[row.id]) || 0));
                 if (!quantity) return;
                 const price = getAccountPrice(row, rates);
-                const capacity = getAccountCapacity(row);
+                const capacity = capacityProfiles.get(row.id);
                 const provider = providers.get(row.providerId) || { name: row.providerId };
                 totalAccounts += quantity;
                 if (Number.isFinite(price.cny)) subscriptionCost += price.cny * quantity;
                 else unknownPriceCount += quantity;
-                if (Number.isFinite(capacity)) knownCapacity += capacity * quantity;
-                else unknownCapacityCount += quantity;
+                if (Number.isFinite(capacity?.baseB)) {
+                    conservativeCapacity += capacity.minB * quantity;
+                    baselineCapacity += capacity.baseB * quantity;
+                    optimisticCapacity += capacity.maxB * quantity;
+                } else {
+                    unknownCapacityCount += quantity;
+                    if (capacity?.kind === 'relative-credit') relativeCapacityCount += quantity;
+                }
                 selected.push({ row, provider, quantity, price, capacity });
             });
             const targetB = current.targetB;
-            const coverage = targetB > 0 ? Math.min(1, knownCapacity / targetB) : 0;
-            const gapB = Math.max(0, targetB - knownCapacity);
+            const conservativeCoverage = targetB > 0 ? conservativeCapacity / targetB : 0;
+            const baselineCoverage = targetB > 0 ? baselineCapacity / targetB : 0;
+            const optimisticCoverage = targetB > 0 ? optimisticCapacity / targetB : 0;
+            const conservativeGapB = Math.max(0, targetB - conservativeCapacity);
+            const baselineGapB = Math.max(0, targetB - baselineCapacity);
+            const optimisticGapB = Math.max(0, targetB - optimisticCapacity);
             const pureApiCost = targetB * apiCostPerB;
             const hasUnknownPrice = unknownPriceCount > 0;
             const hasUnknownCapacity = unknownCapacityCount > 0;
-            const fallbackCost = hasUnknownCapacity ? NaN : gapB * apiCostPerB;
-            const effectiveCost = hasUnknownPrice || hasUnknownCapacity ? NaN : subscriptionCost + fallbackCost;
+            const fallbackCost = baselineGapB * apiCostPerB;
+            const effectiveCost = hasUnknownPrice ? NaN : subscriptionCost + fallbackCost;
             const savings = Number.isFinite(effectiveCost) ? pureApiCost - effectiveCost : NaN;
             const selectedHtml = selected.length ? selected.map(item => {
-                const capText = Number.isFinite(item.capacity) ? (item.capacity * item.quantity).toFixed(2) + 'B' : '未知（未计入已知容量）';
+                const capText = Number.isFinite(item.capacity?.baseB)
+                    ? (item.capacity.baseB * item.quantity).toFixed(2) + 'B 基准（' + (item.capacity.minB * item.quantity).toFixed(2) + '～' + (item.capacity.maxB * item.quantity).toFixed(2) + 'B）'
+                    : (item.capacity?.kind === 'relative-credit' ? item.capacity.label + '，不计入 B 汇总' : '暂无可折算容量');
                 const priceText = Number.isFinite(item.price.cny) ? formatCny(item.price.cny * item.quantity) : '待定';
-                return '<div class="llm-rank-item"><div><strong>' + escapeHtml(item.provider.name) + ' · ' + escapeHtml(item.row.plan) + '</strong><div class="llm-muted">' + item.quantity + ' 个账号；计入容量 ' + escapeHtml(capText) + '；订阅费 ' + escapeHtml(priceText) + '</div></div><div class="llm-muted" style="text-align:right;">' + escapeHtml(item.row.bottleneck) + '</div></div>';
+                return '<div class="llm-rank-item"><div><strong>' + escapeHtml(item.provider.name) + ' · ' + escapeHtml(item.row.plan) + '</strong><div class="llm-muted">' + item.quantity + ' 个账号；容量 ' + escapeHtml(capText) + '；订阅费 ' + escapeHtml(priceText) + '</div></div><div class="llm-muted" style="text-align:right;">' + escapeHtml(item.capacity?.label || item.row.bottleneck) + '</div></div>';
             }).join('') : '<div class="llm-card">购物车为空。请在上方勾选账号并设置数量。</div>';
             const warnings = [];
-            if (hasUnknownCapacity) warnings.push('有 ' + unknownCapacityCount + ' 个账号的 Token/额度容量未知，达成率仅显示已知容量下界；API 缺口和总成本暂不闭合');
+            if (hasUnknownCapacity) warnings.push('有 ' + unknownCapacityCount + ' 个账号没有可折算 Token 容量' + (relativeCapacityCount ? '，其中 ' + relativeCapacityCount + ' 个只有 Credits/积分相对额度' : '') + '；它们不计入 B 汇总，但不会阻断其他账号的基准测算');
             if (hasUnknownPrice) warnings.push('有 ' + unknownPriceCount + ' 个账号没有可换算价格，总成本暂不闭合；请更新脚本内的价格基准');
             if (current.apiMode === 'custom' && current.customApiCost <= 0) warnings.push('你选择了自定义 API 单价，但当前是 0；请填写真实的 ¥/B Token');
-            if (selected.some(item => item.row.capacityMode === 'official-credit')) warnings.push('MiMo 当前官方口径是 Credits，不一定等于裸 Token；建议用你的实际账单/实测值覆盖容量');
-            const capacityGapText = hasUnknownCapacity ? '待定（有未知容量）' : gapB.toFixed(2) + 'B';
-            const fallbackCostText = hasUnknownCapacity ? '待定（有未知容量）' : formatCny(fallbackCost);
             const costText = Number.isFinite(effectiveCost) ? formatCny(effectiveCost) : '待定';
             const savingsText = Number.isFinite(savings) ? formatCny(savings) + '（' + (pureApiCost > 0 ? (savings / pureApiCost * 100).toFixed(1) : '0.0') + '%）' : '待定';
             document.getElementById('llm-calc-summary').innerHTML = [
                 '<div class="llm-card">',
                 '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">',
                 '<div><div class="llm-muted">已选账号</div><strong>' + totalAccounts + ' 个</strong></div>',
-                '<div><div class="llm-muted">已知容量合计</div><strong>' + knownCapacity.toFixed(2) + 'B</strong></div>',
-                '<div><div class="llm-muted">' + (hasUnknownCapacity ? '已知容量达成率（下界）' : '目标达成率') + '</div><strong>' + (coverage * 100).toFixed(1) + '%</strong></div>',
-                '<div><div class="llm-muted">已知容量缺口</div><strong>' + escapeHtml(capacityGapText) + '</strong></div>',
+                '<div><div class="llm-muted">保守 / 基准 / 乐观容量</div><strong>' + conservativeCapacity.toFixed(2) + ' / ' + baselineCapacity.toFixed(2) + ' / ' + optimisticCapacity.toFixed(2) + 'B</strong></div>',
+                '<div><div class="llm-muted">三档目标达成率</div><strong>' + (conservativeCoverage * 100).toFixed(1) + '% / ' + (baselineCoverage * 100).toFixed(1) + '% / ' + (optimisticCoverage * 100).toFixed(1) + '%</strong></div>',
+                '<div><div class="llm-muted">三档容量缺口</div><strong>' + conservativeGapB.toFixed(2) + ' / ' + baselineGapB.toFixed(2) + ' / ' + optimisticGapB.toFixed(2) + 'B</strong></div>',
                 '<div><div class="llm-muted">订阅月费（已知价格）</div><strong>' + formatCny(subscriptionCost) + '</strong></div>',
-                '<div><div class="llm-muted">API 兜底缺口成本</div><strong>' + escapeHtml(fallbackCostText) + '</strong></div>',
-                '<div><div class="llm-muted">购物车有效月成本</div><strong>' + escapeHtml(costText) + '</strong></div>',
+                '<div><div class="llm-muted">API 兜底缺口成本（基准）</div><strong>' + formatCny(fallbackCost) + '</strong></div>',
+                '<div><div class="llm-muted">购物车有效月成本（基准）</div><strong>' + escapeHtml(costText) + '</strong></div>',
                 '<div><div class="llm-muted">纯 API 基准</div><strong>' + formatCny(pureApiCost) + '</strong></div>',
                 '<div><div class="llm-muted">相对纯 API 节省</div><strong>' + escapeHtml(savingsText) + '</strong></div>',
                 '</div>',
                 '<div style="margin-top:10px;"><strong>本次购物车</strong>' + selectedHtml + '</div>',
                 (warnings.length ? '<div class="llm-highlight-promo">⚠️ ' + escapeHtml(warnings.join('；')) + '</div>' : ''),
-                '<div class="llm-muted">说明：总容量只计算勾选数量 × 脚本内单账号容量；没有自动挑选、自动分配或自动补账号。未知容量不估算，未知价格不按 0 计算。币种按“厂商配置”的汇率折算，海外页面的原始币种不会被 IP 推断覆盖。</div>',
+                '<div class="llm-muted">说明：明确 Token 额度按官方周期折算；请求次数按每次 8K / 32K / 100K Token 生成保守、基准、乐观区间。Credits、积分、相对倍数在没有官方换算公式时不折算成 Token。系统不会自动挑选、分配或购买账号；未知价格不按 0 计算。</div>',
                 '</div>'
             ].join('');
         };
@@ -2760,7 +3067,7 @@
                         lines.push('<strong style="color:#e3b341;">结论：Endpoint、API Key 和模型路由均已连通；当前模型或代理没有产生标准最终文本。请检查结束原因和响应结构，必要时提高输出上限或调整代理兼容格式。</strong>');
                     } else if (chat.ok) {
                         lines.push('<span style="color:#3fb950;">② 短消息测试成功</span>：模型返回“' + escapeHtml(sanitizeAiDiagnosticText(chat.content, 80)) + '”；' + escapeHtml(chatDiagnostic));
-                        lines.push('<strong style="color:#3fb950;">结论：Endpoint、API Key、模型路由和返回格式均可用。此前长正文超时更可能是正式复核处理时间超过原来的 30 秒。</strong>');
+                        lines.push('<strong style="color:#3fb950;">结论：Endpoint、API Key、模型路由和返回格式均可用，短消息测试通过。该结果只验证基础调用链路；正式复核能否完成还取决于正文长度、模型处理速度、输出规模和当前超时设置。</strong>');
                     } else {
                         const advice = explainAiDiagnostics(chat.diagnostics);
                         lines.push('<span style="color:#f85149;">② 短消息测试失败：' + escapeHtml(chat.error || '未知错误') + '</span>');
@@ -2843,8 +3150,20 @@
         });
     });
 
-    modal.querySelector('#llm-btn-close').addEventListener('click', () => {
+    const closeModal = () => {
         modal.style.display = 'none';
+        modal.setAttribute('aria-hidden', 'true');
+    };
+
+    const closeButton = modal.querySelector('#llm-btn-close');
+    closeButton.addEventListener('pointerdown', event => event.stopPropagation());
+    closeButton.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeModal();
+    });
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && modal.style.display === 'flex') closeModal();
     });
 
     let isFloaterDragging = false, floaterMoved = false;
@@ -2857,8 +3176,10 @@
         fStartY = e.clientY;
 
         const rect = floater.getBoundingClientRect();
-        fInitLeft = rect.left;
+        fInitLeft = floaterDockSide === 'right' ? window.innerWidth - floater.offsetWidth : (floaterDockSide === 'left' ? 0 : rect.left);
         fInitTop = rect.top;
+
+        setFloaterDock('', false);
 
         floater.style.right = 'auto';
         floater.style.bottom = 'auto';
@@ -2891,16 +3212,31 @@
 
         if (floaterMoved) {
             const rect = floater.getBoundingClientRect();
-            GM_setValue('llm_floater_pos', { left: rect.left, top: rect.top });
+            dockFloater(rect.left, rect.top);
         } else {
             modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
+            modal.setAttribute('aria-hidden', modal.style.display === 'flex' ? 'false' : 'true');
         }
     }
+
+    floater.addEventListener('mouseenter', () => {
+        if (floaterDockSide) setFloaterDock(floaterDockSide, false);
+    });
+    floater.addEventListener('mouseleave', () => {
+        if (floaterDockSide && !isFloaterDragging) setFloaterDock(floaterDockSide, true);
+    });
+    floater.addEventListener('focus', () => {
+        if (floaterDockSide) setFloaterDock(floaterDockSide, false);
+    });
+    floater.addEventListener('blur', () => {
+        if (floaterDockSide && !isFloaterDragging) setFloaterDock(floaterDockSide, true);
+    });
 
     const dragHeader = modal.querySelector('#llm-header-drag');
     let isModalDragging = false, mStartX, mStartY, mInitLeft, mInitTop;
 
     dragHeader.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button, a, input, select, textarea')) return;
         isModalDragging = true;
         mStartX = e.clientX;
         mStartY = e.clientY;
@@ -2927,7 +3263,9 @@
 
     window.addEventListener('resize', () => {
         const floaterRect = floater.getBoundingClientRect();
-        if (floater.style.left) {
+        if (floaterDockSide) {
+            dockFloater(floaterRect.left, floaterRect.top, true);
+        } else if (floater.style.left) {
             floater.style.left = `${Math.max(10, Math.min(window.innerWidth - floater.offsetWidth - 10, floaterRect.left))}px`;
             floater.style.top = `${Math.max(10, Math.min(window.innerHeight - floater.offsetHeight - 10, floaterRect.top))}px`;
         }
