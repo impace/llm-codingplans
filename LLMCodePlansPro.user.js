@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.7.7
+// @version      2.7.8
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_openInTab
+// @grant        GM_setClipboard
 // @connect      *
 // @noframes
 // @run-at       document-idle
@@ -468,6 +469,51 @@
         return AI_SNAPSHOT_KEY_PREFIX + hashText(url);
     }
 
+    function getAiEndpointInfo(endpoint) {
+        try {
+            const parsed = new URL(String(endpoint || ''));
+            return { host: parsed.host, path: parsed.pathname || '/', protocol: parsed.protocol };
+        } catch {
+            return { host: '', path: '', protocol: '' };
+        }
+    }
+
+    function sanitizeAiDiagnosticText(value, maxLength = 320) {
+        return String(value || '')
+            .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [已隐藏]')
+            .replace(/(["']?)(?:api[_ -]?key|apikey|access[_ -]?token|secret)(\1)\s*[:=]\s*(["']?)[A-Za-z0-9._~-]+\3/gi, '[凭证]=[已隐藏]')
+            .replace(/sk-[A-Za-z0-9_-]+/g, 'sk-[已隐藏]')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, maxLength);
+    }
+
+    function summarizeAiResponse(responseText) {
+        const raw = String(responseText || '').trim();
+        if (!raw) return '响应体为空';
+        try {
+            const payload = JSON.parse(raw);
+            const error = payload?.error;
+            const message = typeof error === 'string' ? error : (error?.message || error?.detail || error?.code || payload?.message || '');
+            if (message) return sanitizeAiDiagnosticText(message);
+            return 'JSON 响应，但未找到可读错误字段';
+        } catch {
+            return sanitizeAiDiagnosticText(raw);
+        }
+    }
+
+    function buildAiDiagnostics(endpoint, model, phase, extra = {}) {
+        const info = getAiEndpointInfo(endpoint);
+        return {
+            endpointHost: info.host,
+            endpointPath: info.path,
+            model: String(model || ''),
+            phase: String(phase || ''),
+            checkedAt: new Date().toISOString(),
+            ...extra
+        };
+    }
+
     function saveAiSnapshot(url, snapshot) {
         const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
         GM_setValue(aiSnapshotKey(url), {
@@ -479,6 +525,7 @@
             excerpt: String(source.excerpt || ''),
             rates: source.rates && typeof source.rates === 'object' ? source.rates : {},
             error: String(source.error || ''),
+            diagnostics: source.diagnostics && typeof source.diagnostics === 'object' ? source.diagnostics : null,
             previousData: source.previousData && typeof source.previousData === 'object' ? source.previousData : null,
             data: source.data && typeof source.data === 'object' ? source.data : null
         });
@@ -709,19 +756,37 @@
     function requestAiExtraction(url, sourceResult, reason) {
         const settings = readAppSettings();
         const ai = settings.ai || {};
+        const endpoint = String(ai.endpoint || '').trim();
+        const model = String(ai.model || 'gpt-4o-mini');
         if (!ai.enabled || !String(ai.apiKey || '').trim()) {
-            return Promise.resolve({ ok: false, skipped: true, error: 'AI 抽取未启用或未填写 API Key' });
+            return Promise.resolve({
+                ok: false,
+                skipped: true,
+                error: 'AI 抽取未启用或未填写 API Key',
+                diagnostics: buildAiDiagnostics(endpoint, model, '配置检查', { reason: 'AI 未启用或未填写 API Key' })
+            });
+        }
+        if (!isHttpUrl(endpoint)) {
+            return Promise.resolve({ ok: false, error: 'AI Endpoint 不是有效 HTTP(S) 地址', diagnostics: buildAiDiagnostics(endpoint, model, '配置检查') });
         }
         if (!sourceResult.aiReady) {
             return Promise.resolve({
                 ok: false,
                 skipped: true,
-                error: '正文完整性校验未通过：' + (sourceResult.aiBlockReason || sourceResult.completeness?.reason || '正文不完整')
+                error: '正文完整性校验未通过：' + (sourceResult.aiBlockReason || sourceResult.completeness?.reason || '正文不完整'),
+                diagnostics: buildAiDiagnostics(endpoint, model, '请求前校验', {
+                    reason: sourceResult.aiBlockReason || sourceResult.completeness?.reason || '正文不完整'
+                })
             });
         }
         const text = String(sourceResult.aiExcerpt || buildAiExcerpt(sourceResult.snapshotText || sourceResult.preview || ''))
             .slice(0, Math.max(3000, Math.min(MAX_AI_EXCERPT_CHARS, Number(ai.maxExcerptChars) || 14000)));
-        if (text.length < 120) return Promise.resolve({ ok: false, skipped: true, error: '脚本预检查：正文少于 120 字，未发送 AI 请求' });
+        if (text.length < 120) return Promise.resolve({
+            ok: false,
+            skipped: true,
+            error: '脚本预检查：正文少于 120 字，未发送 AI 请求',
+            diagnostics: buildAiDiagnostics(endpoint, model, '请求前校验', { reason: '正文少于 120 字' })
+        });
         const fx = parseFxRates(settings.currency.rates);
         const prompt = [
             '你是订阅与价格页面的数据审计器。请从下面的官方页面正文中抽取结构化数据。',
@@ -749,11 +814,7 @@
             text
         ].join('\n');
         return new Promise(resolve => {
-            const endpoint = String(ai.endpoint || '').trim();
-            if (!isHttpUrl(endpoint)) {
-                resolve({ ok: false, error: 'AI Endpoint 不是有效 HTTP(S) 地址' });
-                return;
-            }
+            const startedAt = Date.now();
             const headers = { 'Content-Type': 'application/json' };
             if (String(ai.apiKey).trim()) headers.Authorization = 'Bearer ' + String(ai.apiKey).trim();
             GM_xmlhttpRequest({
@@ -772,12 +833,22 @@
                     ]
                 }),
                 onload: response => {
+                    const responseText = String(response.responseText || '');
+                    const diagnostics = buildAiDiagnostics(endpoint, model, '收到响应', {
+                        httpStatus: Number(response.status) || 0,
+                        contentType: getHeader(response.responseHeaders, 'content-type'),
+                        requestId: getHeader(response.responseHeaders, 'x-request-id')
+                            || getHeader(response.responseHeaders, 'request-id')
+                            || getHeader(response.responseHeaders, 'cf-ray'),
+                        responseBytes: responseText.length,
+                        elapsedMs: Date.now() - startedAt
+                    });
                     if (Number(response.status) < 200 || Number(response.status) >= 300) {
-                        resolve({ ok: false, error: 'AI HTTP ' + response.status });
+                        resolve({ ok: false, error: 'AI HTTP ' + response.status + '：' + summarizeAiResponse(responseText), diagnostics });
                         return;
                     }
                     try {
-                        const payload = JSON.parse(response.responseText || '{}');
+                        const payload = JSON.parse(responseText || '{}');
                         const choices = payload.choices || [];
                         const rawContent = (choices[0] && choices[0].message && choices[0].message.content)
                             || payload.output_text
@@ -787,7 +858,8 @@
                             : rawContent;
                         const parsed = parseJsonFromModelText(content);
                         if (!parsed || typeof parsed !== 'object') {
-                            resolve({ ok: false, error: 'AI 返回不是有效 JSON' });
+                            const contentSummary = sanitizeAiDiagnosticText(content || summarizeAiResponse(responseText));
+                            resolve({ ok: false, error: 'AI 返回不是有效 JSON；模型输出摘要：' + contentSummary, diagnostics: { ...diagnostics, phase: '模型内容解析' } });
                             return;
                         }
                         const normalized = normalizeAiExtraction(parsed, fx);
@@ -797,14 +869,15 @@
                             model: ai.model,
                             checkedAt: new Date().toISOString(),
                             needsReview: normalized.needsReview,
-                            data: normalized
+                            data: normalized,
+                            diagnostics
                         });
                     } catch {
-                        resolve({ ok: false, error: 'AI 返回解析失败' });
+                        resolve({ ok: false, error: 'AI 返回解析失败；响应摘要：' + summarizeAiResponse(responseText), diagnostics: { ...diagnostics, phase: '响应 JSON 解析' } });
                     }
                 },
-                onerror: () => resolve({ ok: false, error: 'AI 网络请求失败' }),
-                ontimeout: () => resolve({ ok: false, error: 'AI 请求超时（30秒）' })
+                onerror: error => resolve({ ok: false, error: 'AI 网络请求失败；' + sanitizeAiDiagnosticText(error?.error || error?.message || ''), diagnostics: buildAiDiagnostics(endpoint, model, '网络错误', { elapsedMs: Date.now() - startedAt }) }),
+                ontimeout: () => resolve({ ok: false, error: 'AI 请求超时（30秒）', diagnostics: buildAiDiagnostics(endpoint, model, '请求超时', { elapsedMs: Date.now() - startedAt }) })
             });
         });
     }
@@ -822,10 +895,12 @@
             result.aiCheckedAt = '';
             result.aiModel = '';
         };
+        result.aiDiagnostics = null;
         if (!settings.ai.enabled) {
             if (forceAi) {
                 markAiFailure();
                 result.aiStatus = 'AI未执行：请先在“厂商配置”中启用 AI';
+                result.aiDiagnostics = buildAiDiagnostics(settings.ai.endpoint, settings.ai.model, '配置检查', { reason: 'AI 未启用或未填写 API Key' });
                 saveAiSnapshot(url, {
                     fingerprint: result.fingerprint,
                     status: '未执行',
@@ -834,6 +909,7 @@
                     excerpt: result.aiExcerpt || '',
                     rates: parseFxRates(settings.currency.rates),
                     error: '请先在“厂商配置”中启用 AI',
+                    diagnostics: result.aiDiagnostics,
                     previousData: previousAiExtraction
                 });
             }
@@ -851,6 +927,7 @@
                     ? (result.error || '来源正文抓取失败')
                     : (result.aiBlockReason || result.completeness?.reason || '正文完整性校验未通过');
                 result.aiStatus = 'AI未执行：' + reason + '，未发送请求';
+                result.aiDiagnostics = buildAiDiagnostics(settings.ai.endpoint, settings.ai.model, '请求前校验', { reason });
                 saveAiSnapshot(url, {
                     fingerprint: result.fingerprint,
                     status: '未执行',
@@ -859,6 +936,7 @@
                     excerpt: result.aiExcerpt || '',
                     rates: parseFxRates(settings.currency.rates),
                     error: reason + '，未发送请求',
+                    diagnostics: result.aiDiagnostics,
                     previousData: previousAiExtraction
                 });
             }
@@ -875,6 +953,7 @@
             result.aiStatus = '待人工确认';
             result.aiCheckedAt = aiResult.checkedAt;
             result.aiModel = aiResult.model;
+            result.aiDiagnostics = aiResult.diagnostics || null;
             saveAiSnapshot(url, {
                 fingerprint: result.fingerprint || '',
                 status: '待人工确认',
@@ -882,11 +961,13 @@
                 model: aiResult.model,
                 excerpt: result.aiExcerpt || '',
                 rates: parseFxRates(settings.currency.rates),
-                data: aiResult.data
+                data: aiResult.data,
+                diagnostics: aiResult.diagnostics || null
             });
         } else if (aiResult.skipped) {
             markAiFailure();
             result.aiStatus = 'AI未执行：' + aiResult.error;
+            result.aiDiagnostics = aiResult.diagnostics || null;
             saveAiSnapshot(url, {
                 fingerprint: result.fingerprint,
                 status: '未执行',
@@ -895,11 +976,13 @@
                 excerpt: result.aiExcerpt || '',
                 rates: parseFxRates(settings.currency.rates),
                 error: aiResult.error,
+                diagnostics: aiResult.diagnostics || buildAiDiagnostics(settings.ai.endpoint, settings.ai.model, 'AI 未执行'),
                 previousData: previousAiExtraction
             });
         } else {
             markAiFailure();
             result.aiStatus = 'AI失败：' + aiResult.error;
+            result.aiDiagnostics = aiResult.diagnostics || null;
             saveAiSnapshot(url, {
                 fingerprint: result.fingerprint,
                 status: '失败',
@@ -908,6 +991,7 @@
                 excerpt: result.aiExcerpt || '',
                 rates: parseFxRates(settings.currency.rates),
                 error: aiResult.error,
+                diagnostics: aiResult.diagnostics || buildAiDiagnostics(settings.ai.endpoint, settings.ai.model, 'AI 调用失败'),
                 previousData: previousAiExtraction
             });
         }
@@ -1479,7 +1563,10 @@
                 : (source.previousAiExtraction || null),
             aiCheckedAt: String(source.aiCheckedAt || ''),
             aiModel: String(source.aiModel || ''),
-            aiReused: Boolean(source.aiReused)
+            aiReused: Boolean(source.aiReused),
+            aiDiagnostics: overrides.aiDiagnostics !== undefined
+                ? overrides.aiDiagnostics
+                : (source.aiDiagnostics && typeof source.aiDiagnostics === 'object' ? source.aiDiagnostics : null)
         };
     }
 
@@ -1566,8 +1653,11 @@
         const displayProbe = getProbeDisplay(probe);
         if (!displayProbe.ok) return { kind: 'unavailable', label: 'AI复核：暂不可执行（请先解决来源抓取失败）', color: '#f85149' };
         const status = String(displayProbe.aiStatus || '').trim();
-        if (/^AI失败/.test(status)) {
-            return { kind: 'unavailable', label: 'AI复核：调用失败（可重试）', color: '#f85149' };
+        const snapshot = displayProbe.sourceUrl ? GM_getValue(aiSnapshotKey(displayProbe.sourceUrl), null) : null;
+        if (/^AI失败/.test(status) || snapshot?.status === '失败') {
+            const diagnostics = displayProbe.aiDiagnostics || snapshot?.diagnostics || null;
+            const suffix = diagnostics?.httpStatus ? 'HTTP ' + diagnostics.httpStatus : (diagnostics?.phase || '可重试');
+            return { kind: 'unavailable', label: 'AI复核：调用失败（' + suffix + '）', color: '#f85149' };
         }
         if (/^AI未执行/.test(status)) {
             const reason = /完整性校验|正文过短|正文不足|正文少于\s*120|缺少关键字段/.test(status)
@@ -1605,11 +1695,72 @@
         button.style.borderColor = action ? '#d29922' : '';
     }
 
+    function formatAiDiagnostics(diagnostics) {
+        if (!diagnostics || typeof diagnostics !== 'object') return '';
+        const parts = [
+            diagnostics.checkedAt ? '时间 ' + formatDate(diagnostics.checkedAt) : '',
+            diagnostics.phase ? '阶段 ' + diagnostics.phase : '',
+            diagnostics.httpStatus ? 'HTTP ' + diagnostics.httpStatus : '',
+            diagnostics.endpointHost ? '接口 ' + diagnostics.endpointHost + (diagnostics.endpointPath || '/') : '',
+            diagnostics.model ? '模型 ' + diagnostics.model : '',
+            diagnostics.contentType ? '类型 ' + diagnostics.contentType : '',
+            diagnostics.requestId ? '请求ID ' + diagnostics.requestId : '',
+            Number.isFinite(Number(diagnostics.responseBytes)) ? '响应 ' + Number(diagnostics.responseBytes).toLocaleString() + ' 字节' : '',
+            Number.isFinite(Number(diagnostics.elapsedMs)) ? '耗时 ' + Number(diagnostics.elapsedMs).toLocaleString() + ' ms' : '',
+            diagnostics.reason ? '原因 ' + diagnostics.reason : ''
+        ].filter(Boolean);
+        return parts.join('；');
+    }
+
+    function explainAiDiagnostics(diagnostics) {
+        if (!diagnostics || typeof diagnostics !== 'object') return '';
+        const status = Number(diagnostics.httpStatus) || 0;
+        if (diagnostics.phase === '请求前校验') return '请求未发送：请先解决正文完整性问题';
+        if (diagnostics.phase === '配置检查') return '请求未发送：请检查 AI 开关、API Key 与 Endpoint';
+        if (diagnostics.phase === '网络错误') return '请求未取得 HTTP 响应：检查网络、代理、DNS、跨域连接策略或接口可达性';
+        if (diagnostics.phase === '请求超时') return '接口在 30 秒内没有完成响应：可稍后重试或检查服务状态';
+        if (status === 400) return '请求已到达接口：通常是模型名、请求字段或接口格式不兼容';
+        if (status === 401) return '请求已到达接口：通常是 API Key 无效、过期或 Authorization 格式不对';
+        if (status === 403) return '请求已到达接口：通常是账号权限、模型权限、地区/IP 或接口策略限制';
+        if (status === 404) return '请求已到达服务器：通常是 Endpoint 路径或模型名错误';
+        if (status === 408) return '服务端请求超时，可稍后重试';
+        if (status === 429) return '请求已到达接口：通常是限流、余额不足或配额耗尽';
+        if (status >= 500) return '接口服务端异常，可稍后重试并检查服务状态';
+        if (status >= 200 && status < 300 && diagnostics.phase === '模型内容解析') return 'API 调用成功，但模型内容不是脚本要求的 JSON';
+        if (status >= 200 && status < 300 && diagnostics.phase === '响应 JSON 解析') return 'API 返回成功状态，但响应格式不是兼容的 JSON';
+        return '';
+    }
+
     function formatAiProbeDetail(probe) {
         const displayProbe = getProbeDisplay(probe);
-        if (!displayProbe?.aiExtraction) return '';
-        const label = displayProbe.aiReused || displayProbe.notModified ? '同一正文版本的历史 AI 结果：' : '本次 AI 结果：';
-        return label + escapeHtml(formatAiSnapshot({ data: displayProbe.aiExtraction }));
+        if (!displayProbe) return '';
+        const snapshot = displayProbe.sourceUrl ? GM_getValue(aiSnapshotKey(displayProbe.sourceUrl), null) : null;
+        const diagnostics = displayProbe.aiDiagnostics || snapshot?.diagnostics || null;
+        const diagnosticText = formatAiDiagnostics(diagnostics);
+        const diagnosticAdvice = explainAiDiagnostics(diagnostics);
+        const aiStatus = String(displayProbe.aiStatus || '').trim();
+        const snapshotStatus = String(snapshot?.status || '').trim();
+        const aiError = String(aiStatus || snapshot?.error || '').trim();
+        const cleanAiError = aiError.replace(/^AI失败\s*[:：]?\s*/, '');
+        const aiFailed = /^AI失败/.test(aiStatus) || snapshotStatus === '失败';
+        const parts = [];
+        if (displayProbe.aiExtraction) {
+            const label = displayProbe.aiReused || displayProbe.notModified ? '同一正文版本的历史 AI 结果：' : '本次 AI 结果：';
+            parts.push(label + escapeHtml(formatAiSnapshot({ data: displayProbe.aiExtraction })));
+        }
+        if (aiFailed && cleanAiError) {
+            parts.push('<span style="color:#f85149;">AI错误：' + escapeHtml(cleanAiError) + '</span>');
+        } else if (/^AI未执行/.test(aiError) && diagnosticText) {
+            parts.push('AI状态：' + escapeHtml(aiError));
+        }
+        if (diagnosticText) {
+            const copyText = 'AI诊断：' + diagnosticText
+                + (diagnosticAdvice ? '\n初步判断：' + diagnosticAdvice : '')
+                + (cleanAiError ? '\nAI错误：' + cleanAiError : '');
+            parts.push('AI诊断：' + escapeHtml(diagnosticText) + ' <button type="button" class="llm-btn llm-copy-ai-diagnostics" data-ai-diagnostics="' + escapeHtml(copyText) + '" style="font-size:11px;padding:2px 7px;">复制 AI 诊断</button>');
+            if (diagnosticAdvice) parts.push('初步判断：' + escapeHtml(diagnosticAdvice));
+        }
+        return parts.join('；');
     }
 
     function getProbeDisplay(probe) {
@@ -1638,6 +1789,9 @@
             aiExtraction: hasCurrent('aiExtraction') ? (current.aiExtraction || null) : null,
             previousAiExtraction: hasCurrent('previousAiExtraction') ? (current.previousAiExtraction || null) : null,
             aiReused: hasCurrent('aiReused') ? Boolean(current.aiReused) : false,
+            aiDiagnostics: hasCurrent('aiDiagnostics')
+                ? (current.aiDiagnostics && typeof current.aiDiagnostics === 'object' ? current.aiDiagnostics : null)
+                : (probe.aiDiagnostics && typeof probe.aiDiagnostics === 'object' ? probe.aiDiagnostics : null),
             checkedAt: current.checkedAt || probe.lastAttemptAt || '',
             lastError: '',
             attemptFailed: true,
@@ -2018,7 +2172,7 @@
                     ① <strong>全量抓取检查</strong>：逐个抓取所有定价和更新来源；适合完整巡检，速度较慢，不自动调用 AI。<br>
                     ② <strong>仅抓取定价</strong>：只抓取价格/套餐来源；适合优先核对成本，不自动调用 AI。<br>
                     ③ <strong>刷新本地状态</strong>：不联网，只重新显示已保存结果。每条来源的“抓取检查”默认只采集；打开配置中的自动开关后，仅在首次取得完整正文或完整正文发生变化时自动调用 AI；“AI重新抓取复核”会重新取正文并先做完整性校验，不需要先点“抓取检查”。未通过校验时不会发送 AI 请求。<br>
-                    <span class="llm-muted">AI 复核状态会单独提示：黄色“建议点击”=正文完整且值得复核；灰色“可选”=当前无需重复点；绿色“已完成/历史结果”=已有对应正文版本的 AI 结果；红色“未执行/暂不可执行”=正文不完整、抓取失败或 AI 未配置。AI 结果只作证据辅助，不会自动覆盖厂商主数据。</span>
+                    <span class="llm-muted">AI 复核状态会单独提示：黄色“建议点击”=正文完整且值得复核；灰色“可选”=当前无需重复点；绿色“已完成/历史结果”=已有对应正文版本的 AI 结果；红色“未执行/暂不可执行”=正文不完整、抓取失败或 AI 未配置。调用失败时，来源详情会显示脱敏诊断并可一键复制；不会包含 API Key、请求正文或完整响应。AI 结果只作证据辅助，不会自动覆盖厂商主数据。</span>
                 </div>
             </div>
         `;
@@ -2052,6 +2206,22 @@
             });
         });
         bodyContent.innerHTML = html;
+
+        if (!bodyContent.dataset.aiDiagnosticCopyBound) {
+            bodyContent.dataset.aiDiagnosticCopyBound = '1';
+            bodyContent.addEventListener('click', event => {
+                const button = event.target.closest('.llm-copy-ai-diagnostics');
+                if (!button || !bodyContent.contains(button)) return;
+                const text = button.getAttribute('data-ai-diagnostics') || '';
+                if (!text) return;
+                GM_setClipboard(text, 'text');
+                const original = button.textContent;
+                button.textContent = '已复制';
+                setTimeout(() => {
+                    if (button.isConnected) button.textContent = original;
+                }, 1200);
+            });
+        }
 
         bodyContent.querySelectorAll('.track-read').forEach(el => {
             el.addEventListener('click', () => {
