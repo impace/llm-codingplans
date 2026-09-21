@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.7.5
+// @version      2.7.7
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -226,7 +226,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.7.5';
+    const APP_VERSION = '2.7.7';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -712,9 +712,16 @@
         if (!ai.enabled || !String(ai.apiKey || '').trim()) {
             return Promise.resolve({ ok: false, skipped: true, error: 'AI 抽取未启用或未填写 API Key' });
         }
+        if (!sourceResult.aiReady) {
+            return Promise.resolve({
+                ok: false,
+                skipped: true,
+                error: '正文完整性校验未通过：' + (sourceResult.aiBlockReason || sourceResult.completeness?.reason || '正文不完整')
+            });
+        }
         const text = String(sourceResult.aiExcerpt || buildAiExcerpt(sourceResult.snapshotText || sourceResult.preview || ''))
             .slice(0, Math.max(3000, Math.min(MAX_AI_EXCERPT_CHARS, Number(ai.maxExcerptChars) || 14000)));
-        if (text.length < 120) return Promise.resolve({ ok: false, skipped: true, error: '可供 AI 分析的正文过短' });
+        if (text.length < 120) return Promise.resolve({ ok: false, skipped: true, error: '脚本预检查：正文少于 120 字，未发送 AI 请求' });
         const fx = parseFxRates(settings.currency.rates);
         const prompt = [
             '你是订阅与价格页面的数据审计器。请从下面的官方页面正文中抽取结构化数据。',
@@ -832,9 +839,31 @@
             }
             return result;
         }
+        const hasPreviousComplete = Boolean(previous?.aiReady && previous?.fingerprint && previous?.snapshotText);
+        const hasCurrentAi = Boolean(result.aiExtraction);
         const shouldRun = forceAi
-            || (!skipAutoAi && Boolean(settings.ai.runOnFirstCheck && (result.changed || result.weak || !previous)));
+            || (!skipAutoAi && Boolean(settings.ai.runOnFirstCheck && !hasCurrentAi && (result.changed || !hasPreviousComplete)));
         if (!shouldRun) return result;
+        if (!result.ok || !result.aiReady) {
+            if (forceAi || settings.ai.runOnFirstCheck) {
+                markAiFailure();
+                const reason = !result.ok
+                    ? (result.error || '来源正文抓取失败')
+                    : (result.aiBlockReason || result.completeness?.reason || '正文完整性校验未通过');
+                result.aiStatus = 'AI未执行：' + reason + '，未发送请求';
+                saveAiSnapshot(url, {
+                    fingerprint: result.fingerprint,
+                    status: '未执行',
+                    checkedAt: new Date().toISOString(),
+                    model: settings.ai.model,
+                    excerpt: result.aiExcerpt || '',
+                    rates: parseFxRates(settings.currency.rates),
+                    error: reason + '，未发送请求',
+                    previousData: previousAiExtraction
+                });
+            }
+            return result;
+        }
         const reason = forceAi
             ? '用户手动要求 AI 复核'
             : (result.changed ? '页面正文指纹发生变化' : '首次检查或确定性抽取置信度不足');
@@ -842,6 +871,7 @@
         if (aiResult.ok) {
             result.aiExtraction = aiResult.data;
             delete result.previousAiExtraction;
+            result.aiReused = false;
             result.aiStatus = '待人工确认';
             result.aiCheckedAt = aiResult.checkedAt;
             result.aiModel = aiResult.model;
@@ -928,6 +958,15 @@
     function getSourceProbeRule(url) {
         try {
             const parsed = new URL(url);
+            if (parsed.hostname === 'api-docs.deepseek.com' && /\/quick_start\/pricing\/?$/.test(parsed.pathname)) {
+                return {
+                    mode: 'normal',
+                    extractorId: 'deepseek-pricing',
+                    selectors: ['main', 'article', '[class*="markdown"]', '[class*="docItemContainer"]', 'body'],
+                    minLength: 800,
+                    markers: []
+                };
+            }
             if (parsed.hostname === 'docs.volcengine.com') {
                 return {
                     mode: 'rendered',
@@ -968,6 +1007,88 @@
             return { mode: 'normal' };
         }
         return { mode: 'normal' };
+    }
+
+    function getSourceCompletenessProfile(url) {
+        try {
+            const parsed = new URL(url);
+            if (parsed.hostname === 'api-docs.deepseek.com' && /\/quick_start\/pricing\/?$/.test(parsed.pathname)) {
+                return {
+                    name: 'DeepSeek 定价表',
+                    minLength: 800,
+                    minimumMarkers: 4,
+                    markerGroups: [
+                        { label: '模型名称', pattern: /deepseek-[a-z0-9._-]+/i },
+                        { label: '计价单位', pattern: /百万\s*tokens?/i },
+                        { label: '缓存命中价格', pattern: /缓存命中/i },
+                        { label: '缓存未命中价格', pattern: /缓存未命中/i },
+                        { label: '输出价格', pattern: /百万\s*tokens?输出|输出[^。]{0,80}(?:元|CNY|RMB)/i },
+                        { label: '币种金额', pattern: /\d+(?:\.\d+)?\s*(?:元|CNY|RMB)/i },
+                        { label: '时段价格', pattern: /空闲时段[\s\S]{0,300}高峰时段|高峰时段[\s\S]{0,300}空闲时段/i }
+                    ]
+                };
+            }
+        } catch {}
+        return { name: '通用页面', minLength: 240, minimumMarkers: 0, markerGroups: [] };
+    }
+
+    function assessSourceCompleteness(url, text, probe = {}) {
+        const source = sanitizeProbeText(text || '');
+        const profile = getSourceCompletenessProfile(url);
+        const blocked = /access denied|forbidden|just a moment|enable cookies|verify you are human|captcha|安全验证|人机验证|登录后查看|请先登录/i.test(source);
+        const missing = profile.markerGroups
+            .filter(group => !group.pattern.test(source))
+            .map(group => group.label);
+        const matchedMarkers = profile.markerGroups.length - missing.length;
+        const useful = /价格|定价|套餐|额度|限额|积分|credits?|tokens?|quota|monthly|yearly|模型|model|plan|price|订阅|更新|发布/i.test(source);
+        const lengthEnough = source.length >= profile.minLength;
+        const markersEnough = matchedMarkers >= Math.max(1, Number(profile.minimumMarkers) || profile.markerGroups.length);
+        const structurallyUsable = profile.markerGroups.length ? markersEnough : useful;
+        const complete = Boolean(probe.ok && !blocked && lengthEnough && structurallyUsable && !probe.uncomparable);
+        let reason = '';
+        if (!probe.ok) reason = probe.error || '来源抓取失败';
+        else if (blocked) reason = '页面命中登录墙、验证码或访问限制';
+        else if (!lengthEnough) reason = '正文仅 ' + source.length.toLocaleString() + ' 字，低于 ' + profile.minLength.toLocaleString() + ' 字完整性基准';
+        else if (!markersEnough) reason = '关键结构信号不足，缺少：' + missing.join('、');
+        else if (!useful) reason = '正文中未识别到价格、套餐或更新信息';
+        else if (probe.uncomparable) reason = probe.error || '正文不可比较';
+        const facts = probe.extractFacts || {};
+        const signalCount = Array.isArray(facts.signals) ? facts.signals.length : 0;
+        const priceCount = Array.isArray(facts.prices) ? facts.prices.length : 0;
+        const score = (probe.ok ? 1000 : 0)
+            + (complete ? 5000 : 0)
+            + (!probe.weak ? 600 : 0)
+            + (!probe.uncomparable ? 300 : 0)
+            + Math.min(source.length, 20000) / 10
+            + signalCount * 120
+            + priceCount * 20
+            - (blocked ? 4000 : 0);
+        return {
+            complete,
+            profile: profile.name,
+            minLength: profile.minLength,
+            textLength: source.length,
+            matchedMarkers,
+            totalMarkers: profile.markerGroups.length,
+            missing,
+            reason: complete ? '' : (reason || '正文完整性不足'),
+            score
+        };
+    }
+
+    function applySourceAssessment(result, url) {
+        const target = result && typeof result === 'object' ? result : {};
+        target.completeness = assessSourceCompleteness(url, target.snapshotText || target.preview || '', target);
+        target.aiReady = Boolean(target.ok && !target.weak && !target.uncomparable && target.completeness.complete);
+        target.aiBlockReason = target.aiReady ? '' : (target.completeness.reason || target.error || '正文不完整');
+        return target;
+    }
+
+    function chooseBetterProbe(primary, fallback, url) {
+        const first = applySourceAssessment(primary || {}, url);
+        const second = applySourceAssessment(fallback || {}, url);
+        if (!fallback) return first;
+        return Number(second.completeness?.score || 0) > Number(first.completeness?.score || 0) ? second : first;
     }
 
     function looksLikeDynamicShell(raw, body) {
@@ -1016,8 +1137,8 @@
                             aiExcerpt: previous?.aiExcerpt || '',
                             preview: previous?.preview || '',
                             extractFacts: previous?.extractFacts || null,
-                            aiExtraction: previous?.aiExtraction || null,
-                            aiStatus: previous?.aiStatus || '',
+                            aiExtraction: null,
+                            aiStatus: '',
                             weak: previousText.length < 180,
                             checkedAt: new Date().toISOString(), changed: false, notModified: true,
                             error: previousText.length < 180 ? '服务器返回 304，但缓存正文仍不足' : ''
@@ -1193,16 +1314,20 @@
     }
 
     async function probeSource(url, requestOptions = {}) {
-        const previous = GM_getValue(sourceKey(url), null);
+        const storedPrevious = GM_getValue(sourceKey(url), null);
+        const previous = storedPrevious
+            ? applySourceAssessment({ ...storedPrevious }, url)
+            : null;
         const rule = getSourceProbeRule(url);
         let result = rule.mode === 'rendered'
             ? await requestRenderedSource(url, previous, rule)
             : await requestUpdateCheck(url, previous, requestOptions);
+        result = applySourceAssessment(result, url);
 
-        if (rule.mode !== 'rendered' && (!result.ok || result.weak) && typeof GM_openInTab === 'function') {
-            const renderedRule = { ...rule, mode: 'rendered', minLength: 120 };
+        if (rule.mode !== 'rendered' && (!result.ok || result.weak || !result.completeness?.complete) && typeof GM_openInTab === 'function') {
+            const renderedRule = { ...rule, mode: 'rendered', minLength: Math.max(120, Number(rule.minLength) || 120) };
             const fallbackRes = await requestRenderedSource(url, previous, renderedRule);
-            if (fallbackRes.ok) result = fallbackRes;
+            result = chooseBetterProbe(result, fallbackRes, url);
         }
 
         // 手动 AI 复核必须以这次重新抓到的结果为准，不能把上次 AI 结果混进本次失败状态。
@@ -1211,6 +1336,7 @@
             result.aiStatus = '';
             result.aiCheckedAt = '';
             result.aiModel = '';
+            result.aiReused = false;
         }
 
         result.probeMode = result.rendered ? 'rendered' : rule.mode;
@@ -1219,24 +1345,31 @@
             result.aiExcerpt = buildAiExcerpt(result.snapshotText);
         }
         if (!result.extractFacts && result.snapshotText) result.extractFacts = extractDeterministicFacts(result.snapshotText, url);
-        result.changed = Boolean(!result.weak && previous?.fingerprint && previous.fingerprint !== result.fingerprint);
+        result = applySourceAssessment(result, url);
+        const hasPreviousComplete = Boolean(previous?.aiReady && previous?.fingerprint && previous?.snapshotText);
+        result.firstComplete = Boolean(result.aiReady && !hasPreviousComplete);
+        result.changed = Boolean(result.aiReady && hasPreviousComplete && previous.fingerprint !== result.fingerprint);
         result.sourceUrl = url;
-        result.compareAvailable = Boolean(!result.weak && previous?.fingerprint && result.fingerprint);
+        result.compareAvailable = Boolean(result.aiReady && hasPreviousComplete && result.fingerprint);
         const previousAiExtraction = previous?.aiExtraction || previous?.previousAiExtraction || null;
-        if (!requestOptions.forceAi && !result.aiExtraction && previous && !result.changed && !result.weak) {
-            result.aiExtraction = previous.aiExtraction || null;
-            result.previousAiExtraction = previous.previousAiExtraction || null;
-            result.aiStatus = previous.aiStatus || '';
+        if (!requestOptions.forceAi && !result.aiExtraction && hasPreviousComplete && !result.changed && result.aiReady) {
+            result.aiExtraction = previousAiExtraction;
+            result.previousAiExtraction = null;
+            result.aiStatus = previousAiExtraction
+                ? (previous.aiExtraction ? (previous.aiStatus || '待人工确认') : '待人工确认')
+                : '';
             result.aiCheckedAt = previous.aiCheckedAt || '';
             result.aiModel = previous.aiModel || '';
-        } else if (!requestOptions.forceAi && previous && (result.changed || result.weak)) {
+            result.aiReused = Boolean(previousAiExtraction);
+        } else if (!requestOptions.forceAi && previous && (result.changed || !result.aiReady)) {
             result.aiExtraction = null;
             result.previousAiExtraction = previousAiExtraction;
             result.aiCheckedAt = '';
             result.aiModel = '';
+            result.aiReused = false;
             result.aiStatus = result.changed
                 ? 'AI未复核：正文发生变化'
-                : 'AI未复核：本次正文过短或疑似动态壳';
+                : 'AI未复核：本次正文完整性校验未通过';
             saveAiSnapshot(url, {
                 fingerprint: result.fingerprint,
                 status: '未复核',
@@ -1254,12 +1387,12 @@
             Boolean(requestOptions.forceAi),
             Boolean(requestOptions.skipAutoAi)
         );
-        if (result.ok && (!result.weak || !previous)) {
+        if (result.ok && result.aiReady) {
             result.previousCheckedAt = previous?.checkedAt || '';
             GM_setValue(sourceKey(url), result);
             return result;
         }
-        if (result.ok && result.weak && previous) {
+        if (result.ok && !result.aiReady && previous) {
             const retained = { ...previous };
             const aiAttemptNeedsReview = /^AI(?:失败|未执行|未复核)/.test(String(result.aiStatus || ''));
             retained.lastError = result.error || '本次正文不足，保留上次可比较记录';
@@ -1271,16 +1404,10 @@
             retained.aiExtraction = aiAttemptNeedsReview ? null : (result.aiExtraction || retained.aiExtraction || null);
             retained.aiCheckedAt = aiAttemptNeedsReview ? '' : (result.aiCheckedAt || retained.aiCheckedAt || '');
             retained.aiModel = aiAttemptNeedsReview ? '' : (result.aiModel || retained.aiModel || '');
-            retained.currentProbe = {
-                ok: result.ok,
-                weak: true,
-                uncomparable: Boolean(result.uncomparable),
-                error: result.error || '',
-                aiStatus: result.aiStatus || '',
+            retained.currentProbe = makeCurrentProbe(result, {
                 aiExtraction: aiAttemptNeedsReview ? null : (result.aiExtraction || null),
-                previousAiExtraction: result.previousAiExtraction || null,
-                checkedAt: result.checkedAt || ''
-            };
+                previousAiExtraction: result.previousAiExtraction || null
+            });
             GM_setValue(sourceKey(url), retained);
             return {
                 ...retained,
@@ -1304,36 +1431,88 @@
         retained.aiExtraction = aiAttemptNeedsReview ? null : (result.aiExtraction || retained.aiExtraction || null);
         retained.aiCheckedAt = aiAttemptNeedsReview ? '' : (result.aiCheckedAt || retained.aiCheckedAt || '');
         retained.aiModel = aiAttemptNeedsReview ? '' : (result.aiModel || retained.aiModel || '');
+        retained.currentProbe = makeCurrentProbe(result, {
+            aiExtraction: aiAttemptNeedsReview ? null : (result.aiExtraction || null),
+            previousAiExtraction: result.previousAiExtraction || null
+        });
         GM_setValue(sourceKey(url), retained);
         return {
             ...retained,
             ...(previous ? {} : { ok: false, error: retained.lastError }),
             attemptFailed: true,
-            attemptError: retained.lastError
+            attemptError: retained.lastError,
+            currentProbe: retained.currentProbe
+        };
+    }
+
+    function makeCurrentProbe(result, overrides = {}) {
+        const source = result && typeof result === 'object' ? result : {};
+        return {
+            ok: Boolean(source.ok),
+            status: Number(source.status) || 0,
+            statusText: String(source.statusText || ''),
+            error: String(source.error || ''),
+            weak: Boolean(source.weak),
+            uncomparable: Boolean(source.uncomparable),
+            rendered: Boolean(source.rendered),
+            probeMode: String(source.probeMode || ''),
+            sourceUrl: String(source.sourceUrl || ''),
+            title: String(source.title || ''),
+            bytes: Number(source.bytes) || 0,
+            textLength: Number(source.textLength) || 0,
+            fingerprint: String(source.fingerprint || ''),
+            snapshotText: String(source.snapshotText || ''),
+            aiExcerpt: String(source.aiExcerpt || ''),
+            preview: String(source.preview || ''),
+            extractFacts: source.extractFacts && typeof source.extractFacts === 'object' ? source.extractFacts : null,
+            completeness: source.completeness && typeof source.completeness === 'object' ? source.completeness : null,
+            aiReady: Boolean(source.aiReady),
+            aiBlockReason: String(source.aiBlockReason || ''),
+            compareAvailable: Boolean(source.compareAvailable),
+            changed: Boolean(source.changed),
+            notModified: Boolean(source.notModified),
+            checkedAt: source.checkedAt || new Date().toISOString(),
+            aiStatus: String(overrides.aiStatus ?? source.aiStatus ?? ''),
+            aiExtraction: overrides.aiExtraction !== undefined ? overrides.aiExtraction : (source.aiExtraction || null),
+            previousAiExtraction: overrides.previousAiExtraction !== undefined
+                ? overrides.previousAiExtraction
+                : (source.previousAiExtraction || null),
+            aiCheckedAt: String(source.aiCheckedAt || ''),
+            aiModel: String(source.aiModel || ''),
+            aiReused: Boolean(source.aiReused)
         };
     }
 
     function probeSummary(probe) {
-        const aiReview = getAiReviewState(probe);
-        const aiNotice = aiReview.kind === 'action' ? '；建议点击 AI 复核' : '';
-        if (probe?.attemptFailed && probe.ok) {
-            return { label: `本次失败：${probe.attemptError}；保留 ${formatDate(probe.checkedAt)} 记录`, color: '#e3b341' };
-        }
         if (!probe) return { label: '未检查', color: '#8b949e' };
-        if (!probe.ok) return { label: '失败：' + (probe.error || '未知错误'), color: '#f85149' };
-        if (probe.uncomparable) return { label: (probe.error || '页面可访问；动态渲染，未取得可比较正文') + aiNotice, color: '#e3b341' };
-        if (probe.error && Number(probe.textLength || 0) === 0) return { label: probe.error + '（' + formatDate(probe.checkedAt) + '）', color: '#e3b341' };
-        if (probe.changed) return { label: `页面发生更新（${formatDate(probe.checkedAt)}）` + aiNotice, color: '#e3b341' };
-        if (probe.weak) return { label: `内容过短（${formatDate(probe.checkedAt)}）` + aiNotice, color: '#e3b341' };
-        const len = Number(probe.textLength || probe.bytes || 0).toLocaleString();
-        const facts = probe.extractFacts && probe.extractFacts.signals && probe.extractFacts.signals.length
-            ? '；' + probe.extractFacts.signals.join('，')
+        const displayProbe = getProbeDisplay(probe);
+        const isRetained = Boolean(probe.currentProbe || probe.attemptFailed);
+        const len = Number(displayProbe.textLength || displayProbe.bytes || 0).toLocaleString();
+        const checkedAt = formatDate(displayProbe.checkedAt);
+        const facts = displayProbe.extractFacts && displayProbe.extractFacts.signals && displayProbe.extractFacts.signals.length
+            ? '；' + displayProbe.extractFacts.signals.join('，')
             : '';
-        const ai = probe.aiStatus ? '；' + probe.aiStatus : '';
-        const rendered = probe.rendered
-            ? (probe.compareAvailable ? '动态渲染，已比较正文' : '动态渲染，已保存正文；首次无历史可比')
+
+        if (isRetained) {
+            const reason = displayProbe.error
+                || displayProbe.aiBlockReason
+                || displayProbe.completeness?.reason
+                || (displayProbe.uncomparable ? '页面可访问，但正文不可比较' : (displayProbe.weak ? '本次正文过短或不完整' : '本次检查失败'));
+            const current = '本次' + (displayProbe.ok ? '正文不完整' : '检查失败') + '：' + reason + ' · ' + len + ' 字（' + checkedAt + '）';
+            const retained = displayProbe.retainedCheckedAt
+                ? `；沿用上次成功记录（${formatDate(displayProbe.retainedCheckedAt)}）`
+                : '';
+            return { label: current + retained, color: displayProbe.ok ? '#e3b341' : '#f85149' };
+        }
+        if (!displayProbe.ok) return { label: '失败：' + (displayProbe.error || '未知错误'), color: '#f85149' };
+        if (displayProbe.uncomparable) return { label: (displayProbe.error || '页面可访问；动态渲染，未取得可比较正文') + '（' + checkedAt + '）', color: '#e3b341' };
+        if (displayProbe.error && Number(displayProbe.textLength || 0) === 0) return { label: displayProbe.error + '（' + checkedAt + '）', color: '#e3b341' };
+        if (displayProbe.changed) return { label: `页面发生更新（${checkedAt}）`, color: '#e3b341' };
+        if (displayProbe.weak) return { label: `内容过短（${checkedAt}）`, color: '#e3b341' };
+        const rendered = displayProbe.rendered
+            ? (displayProbe.compareAvailable ? '动态渲染，已比较正文' : '动态渲染，已保存正文；首次无历史可比')
             : '静态正文';
-        return { label: rendered + ' · ' + len + ' 字' + facts + ai + '（' + formatDate(probe.checkedAt) + '）', color: probe.aiStatus ? '#e3b341' : '#3fb950' };
+        return { label: rendered + ' · ' + len + ' 字' + facts + '（' + checkedAt + '）', color: '#3fb950' };
     }
 
     function formatAiSnapshot(snapshot) {
@@ -1384,22 +1563,30 @@
 
     function getAiReviewState(probe) {
         if (!probe) return { kind: 'none', label: 'AI复核：可选（尚未检查）', color: '#8b949e' };
-        if (!probe.ok) return { kind: 'unavailable', label: 'AI复核：暂不可执行（请先解决来源抓取失败）', color: '#f85149' };
-        const status = String(probe.aiStatus || '').trim();
-        if (/^AI(?:失败|未执行)/.test(status)) {
-            const reason = /正文过短|正文不足/.test(status)
-                ? '正文不足，无法分析'
-                : (/(?:未启用|Key|Endpoint)/i.test(status) ? '需先配置 AI' : '可重试');
-            return { kind: 'unavailable', label: 'AI复核：未完成（' + reason + '）', color: '#f85149' };
+        const displayProbe = getProbeDisplay(probe);
+        if (!displayProbe.ok) return { kind: 'unavailable', label: 'AI复核：暂不可执行（请先解决来源抓取失败）', color: '#f85149' };
+        const status = String(displayProbe.aiStatus || '').trim();
+        if (/^AI失败/.test(status)) {
+            return { kind: 'unavailable', label: 'AI复核：调用失败（可重试）', color: '#f85149' };
         }
-        if (probe.aiExtraction) {
+        if (/^AI未执行/.test(status)) {
+            const reason = /完整性校验|正文过短|正文不足|正文少于\s*120|缺少关键字段/.test(status)
+                ? '正文完整性校验未通过，未发送请求'
+                : (/(?:未启用|Key|Endpoint)/i.test(status) ? 'AI 未启用或未配置' : '未满足执行条件');
+            return { kind: 'unavailable', label: 'AI复核：未执行（' + reason + '）', color: '#f85149' };
+        }
+        if (displayProbe.aiExtraction) {
+            if (displayProbe.aiReused || displayProbe.notModified) {
+                return { kind: 'done', label: 'AI复核：已存在同一正文版本的历史结果', color: '#3fb950' };
+            }
             return { kind: 'done', label: 'AI复核：已完成，结果待人工确认', color: '#3fb950' };
         }
-        if (Number(probe.textLength || 0) < 120) {
-            return { kind: 'unavailable', label: 'AI复核：暂不可执行（可供 AI 分析的正文不足 120 字）', color: '#f85149' };
+        if (!displayProbe.aiReady) {
+            const reason = displayProbe.aiBlockReason || displayProbe.completeness?.reason || '正文完整性校验未通过';
+            return { kind: 'unavailable', label: 'AI复核：暂不可执行（' + reason + '）', color: '#f85149' };
         }
-        const facts = probe.extractFacts || {};
-        if (probe.changed || probe.weak || probe.uncomparable || !Array.isArray(facts.signals) || !facts.signals.length || /^AI未复核/.test(status)) {
+        const facts = displayProbe.extractFacts || {};
+        if (displayProbe.changed || displayProbe.weak || displayProbe.uncomparable || !Array.isArray(facts.signals) || !facts.signals.length || /^AI未复核/.test(status)) {
             const ai = readAppSettings().ai || {};
             if (!ai.enabled || !String(ai.apiKey || '').trim() || !isHttpUrl(ai.endpoint)) {
                 return { kind: 'unavailable', label: 'AI复核：建议复核，但需先在厂商配置中启用 AI 并填写 Key', color: '#e3b341' };
@@ -1416,6 +1603,47 @@
         button.textContent = action ? '建议 AI复核' : 'AI重新抓取复核';
         button.title = state.label + '；点击后会重新抓取正文';
         button.style.borderColor = action ? '#d29922' : '';
+    }
+
+    function formatAiProbeDetail(probe) {
+        const displayProbe = getProbeDisplay(probe);
+        if (!displayProbe?.aiExtraction) return '';
+        const label = displayProbe.aiReused || displayProbe.notModified ? '同一正文版本的历史 AI 结果：' : '本次 AI 结果：';
+        return label + escapeHtml(formatAiSnapshot({ data: displayProbe.aiExtraction }));
+    }
+
+    function getProbeDisplay(probe) {
+        if (!probe || !probe.currentProbe || typeof probe.currentProbe !== 'object') return probe;
+        const current = probe.currentProbe;
+        const hasCurrent = key => Object.prototype.hasOwnProperty.call(current, key);
+        return {
+            ...probe,
+            ...current,
+            ok: current.ok !== undefined ? Boolean(current.ok) : Boolean(probe.ok),
+            weak: current.weak !== undefined ? Boolean(current.weak) : true,
+            uncomparable: current.uncomparable !== undefined ? Boolean(current.uncomparable) : true,
+            rendered: current.rendered !== undefined ? Boolean(current.rendered) : false,
+            bytes: Number(current.bytes) || 0,
+            textLength: Number(current.textLength) || 0,
+            sourceUrl: String(current.sourceUrl || ''),
+            fingerprint: String(current.fingerprint || ''),
+            extractFacts: current.extractFacts && typeof current.extractFacts === 'object' ? current.extractFacts : null,
+            completeness: current.completeness && typeof current.completeness === 'object' ? current.completeness : null,
+            aiReady: hasCurrent('aiReady') ? Boolean(current.aiReady) : false,
+            aiBlockReason: hasCurrent('aiBlockReason') ? String(current.aiBlockReason || '') : '',
+            changed: hasCurrent('changed') ? Boolean(current.changed) : false,
+            compareAvailable: hasCurrent('compareAvailable') ? Boolean(current.compareAvailable) : false,
+            notModified: hasCurrent('notModified') ? Boolean(current.notModified) : false,
+            aiStatus: hasCurrent('aiStatus') ? String(current.aiStatus || '') : '',
+            aiExtraction: hasCurrent('aiExtraction') ? (current.aiExtraction || null) : null,
+            previousAiExtraction: hasCurrent('previousAiExtraction') ? (current.previousAiExtraction || null) : null,
+            aiReused: hasCurrent('aiReused') ? Boolean(current.aiReused) : false,
+            checkedAt: current.checkedAt || probe.lastAttemptAt || '',
+            lastError: '',
+            attemptFailed: true,
+            attemptError: current.error || probe.lastError || '本次检查未取得可靠正文',
+            retainedCheckedAt: probe.checkedAt || ''
+        };
     }
 
     function getProviderAiSnapshot(provider) {
@@ -1486,42 +1714,57 @@
 
     function formatProbeDetails(probe, url) {
         if (!probe) return '<div class="llm-muted" data-source-details>尚未取得正文。点击“检查”开始。</div>';
-        const facts = probe.extractFacts || {};
-        const priceFacts = Array.isArray(facts.prices) ? facts.prices.slice(0, 5).map(item => {
+        const displayProbe = getProbeDisplay(probe);
+        const retained = Boolean(probe.currentProbe || probe.attemptFailed);
+        const facts = displayProbe.extractFacts || {};
+        const formatPriceFacts = sourceFacts => Array.isArray(sourceFacts?.prices) ? sourceFacts.prices.slice(0, 5).map(item => {
             const cny = Number(item.amountCny);
             const displayAmount = Number(item.amountDisplay);
-            const displayCode = normalizeCurrencyCode(facts.displayCurrency || 'CNY');
+            const displayCode = normalizeCurrencyCode(sourceFacts.displayCurrency || 'CNY');
             return escapeHtml(item.raw || (currencySymbol(item.currency) + item.amount))
                 + (Number.isFinite(displayAmount) ? '≈' + escapeHtml(currencySymbol(displayCode) + displayAmount.toFixed(2)) : (Number.isFinite(cny) ? '≈' + escapeHtml(formatCny(cny)) : '（未换算）'));
         }).join('、') : '';
-        const aiNeedsReview = /^AI(?:失败|未执行|未复核)/.test(String(probe.aiStatus || ''));
-        const aiReview = getAiReviewState(probe);
-        const previousAi = probe.previousAiExtraction || null;
-        const ai = aiNeedsReview
-            ? 'AI：' + escapeHtml(probe.aiStatus) + (previousAi ? '；上次 AI 结果：' + escapeHtml(formatAiSnapshot({ data: previousAi })) : '')
-            : (probe.aiExtraction
-                ? 'AI：' + escapeHtml(formatAiSnapshot({ data: probe.aiExtraction }))
-                : (probe.aiStatus ? 'AI：' + escapeHtml(probe.aiStatus) : 'AI：未复核'));
-        const aiEvidence = probe.aiExtraction && Array.isArray(probe.aiExtraction.prices)
-            ? probe.aiExtraction.prices.slice(0, 3).map(item => String(item.plan || '未标注套餐') + '：“' + String(item.evidence || '无原文证据') + '”').join('；')
+        const priceFacts = formatPriceFacts(facts);
+        const previousPriceFacts = retained ? formatPriceFacts(probe.extractFacts || {}) : '';
+        const ai = formatAiProbeDetail(displayProbe);
+        const aiEvidence = displayProbe.aiExtraction && Array.isArray(displayProbe.aiExtraction.prices)
+            ? displayProbe.aiExtraction.prices.slice(0, 3).map(item => String(item.plan || '未标注套餐') + '：“' + String(item.evidence || '无原文证据') + '”').join('；')
             : '';
+        const partial = retained || displayProbe.weak || displayProbe.uncomparable;
         const factsText = [
             facts.confidence ? '确定性抽取 ' + facts.confidence : '',
             facts.inferredCurrency && facts.inferredCurrency !== 'UNKNOWN' ? '页面推断币种 ' + facts.inferredCurrency : '页面币种未明确',
-            priceFacts ? '价格 ' + priceFacts : ''
+            priceFacts ? (partial ? '本次片段规则识别价格（可能不完整） ' : '本地规则识别价格（仅金额线索，可能漏项） ') + priceFacts : ''
         ].filter(Boolean).join('；');
-        const probeError = probe.error || probe.attemptError || probe.lastError || '';
-        const textLength = Number(probe.textLength || 0);
-        const rendered = probe.uncomparable
+        const probeError = displayProbe.error
+            || (!displayProbe.ok ? (displayProbe.attemptError || displayProbe.lastError || '') : '');
+        const textLength = Number(displayProbe.textLength || 0);
+        const rendered = displayProbe.uncomparable
             ? '页面可访问，但未取得可比较正文'
             : probeError
-                ? ((probe.rendered ? '动态渲染异常：' : 'HTTP正文异常：') + probeError)
+                ? ((displayProbe.rendered ? '动态渲染异常：' : 'HTTP正文异常：') + probeError)
                 : textLength === 0
-                    ? (probe.rendered ? '动态渲染未取得正文' : 'HTTP响应正文为空')
-                    : (probe.rendered ? '动态渲染正文已保存' : 'HTTP 正文已保存');
-        return '<div class="llm-muted" data-source-details>' + escapeHtml(rendered) + '；' + escapeHtml(factsText || '暂未识别结构化价格') + '；' + ai
+                    ? (displayProbe.rendered ? '动态渲染未取得正文' : 'HTTP响应正文为空')
+                    : displayProbe.weak
+                        ? (displayProbe.rendered ? '动态渲染正文已保存，但正文过短或不完整' : 'HTTP 正文已保存，但正文过短或不完整')
+                    : (displayProbe.rendered ? '动态渲染正文已保存' : 'HTTP 正文已保存');
+        const currentText = '本次正文 ' + textLength.toLocaleString() + ' 字';
+        const completeness = displayProbe.completeness && typeof displayProbe.completeness === 'object'
+            ? (displayProbe.completeness.complete
+                ? '正文完整性校验通过（' + String(displayProbe.completeness.profile || '通用页面') + '）'
+                : '正文完整性校验未通过：' + String(displayProbe.completeness.reason || displayProbe.aiBlockReason || '正文不完整'))
+            : '正文完整性尚未评估；请重新抓取';
+        const retainedText = retained
+            ? '<br><span style="color:#e3b341;">本次抓取与历史记录已分开：本次结果未把历史价格当成本次抓取结果；' + (previousPriceFacts ? '下方“上次成功记录价格”不是本次抓取结果。' : '本次未取得可用于完整判断的正文。') + '</span>'
+            : '';
+        const previousText = previousPriceFacts
+            ? '<br><span style="color:#8b949e;">上次成功记录价格（' + escapeHtml(formatDate(probe.checkedAt)) + '）：' + previousPriceFacts + '</span>'
+            : '';
+        return '<div class="llm-muted" data-source-details>' + escapeHtml(rendered) + '；' + escapeHtml(currentText) + '；' + escapeHtml(completeness) + '；' + escapeHtml(factsText || '本次正文未识别结构化价格')
+            + (ai ? '；' + ai : '')
             + (aiEvidence ? '<br>AI原文证据：' + escapeHtml(aiEvidence) : '')
-            + '<br><span data-ai-review-status style="color:' + aiReview.color + ';">' + escapeHtml(aiReview.label) + '</span>'
+            + retainedText
+            + previousText
             + '<br><span style="word-break:break-all;">证据来源：' + escapeHtml(url || probe.sourceUrl || '') + '</span></div>';
     }
 
@@ -1774,8 +2017,8 @@
                     <strong>雷达操作说明</strong><br>
                     ① <strong>全量抓取检查</strong>：逐个抓取所有定价和更新来源；适合完整巡检，速度较慢，不自动调用 AI。<br>
                     ② <strong>仅抓取定价</strong>：只抓取价格/套餐来源；适合优先核对成本，不自动调用 AI。<br>
-                    ③ <strong>刷新本地状态</strong>：不联网，只重新显示已保存结果。每条来源的“抓取检查”默认只采集；打开配置中的自动开关后，首次、正文变化或正文过短才会自动调用 AI；“AI重新抓取复核”会强制重新取正文并尝试调用 AI，不需要先点“抓取检查”。未启用 AI 或未填 Key 时会明确显示未执行。<br>
-                    <span class="llm-muted">AI 复核状态会单独提示：黄色“建议点击”=建议复核但不是强制；灰色“可选”=当前无需重复点；绿色“已完成”=本次已有 AI 结果；红色“未完成/暂不可执行”=先处理抓取或 AI 配置。AI 结果只作证据辅助，不会自动覆盖厂商主数据。</span>
+                    ③ <strong>刷新本地状态</strong>：不联网，只重新显示已保存结果。每条来源的“抓取检查”默认只采集；打开配置中的自动开关后，仅在首次取得完整正文或完整正文发生变化时自动调用 AI；“AI重新抓取复核”会重新取正文并先做完整性校验，不需要先点“抓取检查”。未通过校验时不会发送 AI 请求。<br>
+                    <span class="llm-muted">AI 复核状态会单独提示：黄色“建议点击”=正文完整且值得复核；灰色“可选”=当前无需重复点；绿色“已完成/历史结果”=已有对应正文版本的 AI 结果；红色“未执行/暂不可执行”=正文不完整、抓取失败或 AI 未配置。AI 结果只作证据辅助，不会自动覆盖厂商主数据。</span>
                 </div>
             </div>
         `;
@@ -2054,7 +2297,7 @@
             '<label class="llm-settings-label">Endpoint</label><input type="text" data-ai-endpoint value="' + escapeHtml(app.ai.endpoint) + '" />',
             '<label class="llm-settings-label">模型名</label><input type="text" data-ai-model value="' + escapeHtml(app.ai.model) + '" />',
             '<label class="llm-settings-label">API Key（本地保存）</label><input type="password" data-ai-key value="' + escapeHtml(app.ai.apiKey) + '" autocomplete="off" />',
-            '<label class="llm-settings-label"><input type="checkbox" data-ai-first-check ' + (app.ai.runOnFirstCheck ? 'checked' : '') + ' /> 普通“抓取检查”遇到首次抓取、正文变化或正文过短时自动调用 AI（会产生 API 费用）</label>',
+            '<label class="llm-settings-label"><input type="checkbox" data-ai-first-check ' + (app.ai.runOnFirstCheck ? 'checked' : '') + ' /> 普通“抓取检查”在首次取得完整正文或完整正文发生变化时自动调用 AI（会产生 API 费用）</label>',
             '<label class="llm-settings-label">送入 AI 的最大正文字符数</label><input type="number" data-ai-max-chars min="3000" max="' + MAX_AI_EXCERPT_CHARS + '" step="500" value="' + Number(app.ai.maxExcerptChars || 14000) + '" />',
             '</div>',
             '<div class="llm-settings-row">',
