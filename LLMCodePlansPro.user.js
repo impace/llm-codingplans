@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.7.9
+// @version      2.8.0
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -227,7 +227,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.7.9';
+    const APP_VERSION = '2.8.0';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -245,7 +245,8 @@
             model: 'gpt-4o-mini',
             apiKey: '',
             runOnFirstCheck: false,
-            maxExcerptChars: 14000
+            maxExcerptChars: 14000,
+            timeoutSeconds: 120
         },
         currency: {
             display: 'CNY',
@@ -514,6 +515,57 @@
         };
     }
 
+    function flattenAiText(value) {
+        if (typeof value === 'string') return value;
+        if (Array.isArray(value)) return value.map(flattenAiText).filter(Boolean).join('');
+        if (!value || typeof value !== 'object') return '';
+        if (typeof value.text === 'string') return value.text;
+        if (typeof value.output_text === 'string') return value.output_text;
+        if (typeof value.value === 'string') return value.value;
+        if (value.content !== undefined) return flattenAiText(value.content);
+        return '';
+    }
+
+    function extractAiResponse(payload) {
+        const source = payload && typeof payload === 'object' ? payload : {};
+        const choice = Array.isArray(source.choices) ? (source.choices[0] || {}) : {};
+        const message = choice.message && typeof choice.message === 'object' ? choice.message : {};
+        const outputItems = Array.isArray(source.output) ? source.output : [];
+        const outputContent = outputItems.flatMap(item => Array.isArray(item?.content) ? item.content : []);
+        const outputText = outputContent
+            .filter(part => !part?.type || /(?:output_)?text|message/i.test(String(part.type)))
+            .map(flattenAiText)
+            .filter(Boolean)
+            .join('');
+        const outputReasoning = outputItems
+            .filter(item => /reason/i.test(String(item?.type || '')))
+            .map(item => flattenAiText(item?.summary || item?.content || item?.text || ''))
+            .filter(Boolean)
+            .join('');
+        const content = flattenAiText(message.content)
+            || flattenAiText(choice.text)
+            || flattenAiText(source.output_text)
+            || outputText;
+        const reasoning = flattenAiText(message.reasoning_content)
+            || flattenAiText(message.reasoning)
+            || flattenAiText(choice.reasoning_content)
+            || flattenAiText(source.reasoning)
+            || outputReasoning;
+        const finishReason = String(choice.finish_reason || source.finish_reason || source.stop_reason || source.status || '');
+        const structureParts = [
+            '顶层=' + Object.keys(source).slice(0, 12).join(','),
+            Object.keys(choice).length ? 'choice=' + Object.keys(choice).slice(0, 10).join(',') : '',
+            Object.keys(message).length ? 'message=' + Object.keys(message).slice(0, 10).join(',') : '',
+            outputItems.length ? 'output类型=' + outputItems.map(item => String(item?.type || 'unknown')).slice(0, 8).join(',') : ''
+        ].filter(Boolean);
+        return {
+            content: String(content || ''),
+            reasoning: String(reasoning || ''),
+            finishReason,
+            structureSummary: sanitizeAiDiagnosticText(structureParts.join('；'), 500)
+        };
+    }
+
     function getAiModelsEndpoint(endpoint) {
         try {
             const parsed = new URL(String(endpoint || ''));
@@ -623,12 +675,12 @@
             endpoint,
             model,
             apiKey,
-            timeout: 30000,
+            timeout: 60000,
             phase: '短消息测试',
             data: {
                 model,
                 temperature: 0,
-                max_tokens: 8,
+                max_tokens: 128,
                 stream: false,
                 messages: [
                     { role: 'system', content: '严格按用户要求，只输出最短答案。' },
@@ -639,14 +691,24 @@
         if (chat.ok) {
             try {
                 const payload = JSON.parse(chat.responseText || '{}');
-                const rawContent = payload?.choices?.[0]?.message?.content || payload?.output_text || '';
-                chat.content = Array.isArray(rawContent)
-                    ? rawContent.map(part => typeof part === 'string' ? part : (part?.text || '')).join('')
-                    : String(rawContent || '');
-                if (!chat.content.trim()) {
-                    chat.ok = false;
-                    chat.error = 'HTTP 成功，但没有找到兼容的模型输出字段';
-                    chat.diagnostics.phase = '短消息响应解析';
+                const extracted = extractAiResponse(payload);
+                chat.content = extracted.content;
+                chat.reasoning = extracted.reasoning;
+                chat.finishReason = extracted.finishReason;
+                chat.structureSummary = extracted.structureSummary;
+                chat.diagnostics.finishReason = extracted.finishReason;
+                chat.diagnostics.responseStructure = extracted.structureSummary;
+                chat.routeOk = true;
+                if (!chat.content.trim() && chat.reasoning.trim()) {
+                    chat.ok = true;
+                    chat.partial = true;
+                    chat.error = '接口与模型路由成功，但本次只有推理内容，未产生最终文本';
+                    chat.diagnostics.phase = '短消息仅有推理内容';
+                } else if (!chat.content.trim()) {
+                    chat.ok = true;
+                    chat.partial = true;
+                    chat.error = '接口与模型路由成功，但响应中没有可识别的最终文本';
+                    chat.diagnostics.phase = '短消息无最终文本';
                 }
             } catch {
                 chat.ok = false;
@@ -901,6 +963,7 @@
         const ai = settings.ai || {};
         const endpoint = String(ai.endpoint || '').trim();
         const model = String(ai.model || 'gpt-4o-mini');
+        const timeoutSeconds = Math.min(300, Math.max(30, Number(ai.timeoutSeconds) || 120));
         if (!ai.enabled || !String(ai.apiKey || '').trim()) {
             return Promise.resolve({
                 ok: false,
@@ -963,7 +1026,7 @@
             GM_xmlhttpRequest({
                 method: 'POST',
                 url: endpoint,
-                timeout: 30000,
+                timeout: timeoutSeconds * 1000,
                 anonymous: true,
                 headers,
                 data: JSON.stringify({
@@ -992,16 +1055,13 @@
                     }
                     try {
                         const payload = JSON.parse(responseText || '{}');
-                        const choices = payload.choices || [];
-                        const rawContent = (choices[0] && choices[0].message && choices[0].message.content)
-                            || payload.output_text
-                            || '';
-                        const content = Array.isArray(rawContent)
-                            ? rawContent.map(part => typeof part === 'string' ? part : (part?.text || '')).join('')
-                            : rawContent;
+                        const extracted = extractAiResponse(payload);
+                        const content = extracted.content;
+                        diagnostics.finishReason = extracted.finishReason;
+                        diagnostics.responseStructure = extracted.structureSummary;
                         const parsed = parseJsonFromModelText(content);
                         if (!parsed || typeof parsed !== 'object') {
-                            const contentSummary = sanitizeAiDiagnosticText(content || summarizeAiResponse(responseText));
+                            const contentSummary = sanitizeAiDiagnosticText(content || extracted.reasoning || summarizeAiResponse(responseText));
                             resolve({ ok: false, error: 'AI 返回不是有效 JSON；模型输出摘要：' + contentSummary, diagnostics: { ...diagnostics, phase: '模型内容解析' } });
                             return;
                         }
@@ -1020,7 +1080,7 @@
                     }
                 },
                 onerror: error => resolve({ ok: false, error: 'AI 网络请求失败；' + sanitizeAiDiagnosticText(error?.error || error?.message || ''), diagnostics: buildAiDiagnostics(endpoint, model, '网络错误', { elapsedMs: Date.now() - startedAt }) }),
-                ontimeout: () => resolve({ ok: false, error: 'AI 请求超时（30秒）', diagnostics: buildAiDiagnostics(endpoint, model, '请求超时', { elapsedMs: Date.now() - startedAt }) })
+                ontimeout: () => resolve({ ok: false, error: 'AI 请求超时（' + timeoutSeconds + '秒）', diagnostics: buildAiDiagnostics(endpoint, model, '请求超时', { elapsedMs: Date.now() - startedAt, timeoutSeconds }) })
             });
         });
     }
@@ -1848,6 +1908,8 @@
             diagnostics.model ? '模型 ' + diagnostics.model : '',
             diagnostics.contentType ? '类型 ' + diagnostics.contentType : '',
             diagnostics.requestId ? '请求ID ' + diagnostics.requestId : '',
+            diagnostics.finishReason ? '结束原因 ' + diagnostics.finishReason : '',
+            diagnostics.responseStructure ? '结构 ' + diagnostics.responseStructure : '',
             Number.isFinite(Number(diagnostics.responseBytes)) ? '响应 ' + Number(diagnostics.responseBytes).toLocaleString() + ' 字节' : '',
             Number.isFinite(Number(diagnostics.elapsedMs)) ? '耗时 ' + Number(diagnostics.elapsedMs).toLocaleString() + ' ms' : '',
             diagnostics.reason ? '原因 ' + diagnostics.reason : ''
@@ -2613,9 +2675,10 @@
             '<label class="llm-settings-label">API Key（本地保存）</label><input type="password" data-ai-key value="' + escapeHtml(app.ai.apiKey) + '" autocomplete="off" />',
             '<label class="llm-settings-label"><input type="checkbox" data-ai-first-check ' + (app.ai.runOnFirstCheck ? 'checked' : '') + ' /> 普通“抓取检查”在首次取得完整正文或完整正文发生变化时自动调用 AI（会产生 API 费用）</label>',
             '<label class="llm-settings-label">送入 AI 的最大正文字符数</label><input type="number" data-ai-max-chars min="3000" max="' + MAX_AI_EXCERPT_CHARS + '" step="500" value="' + Number(app.ai.maxExcerptChars || 14000) + '" />',
+            '<label class="llm-settings-label">正式 AI 复核超时（秒）</label><input type="number" data-ai-timeout min="30" max="300" step="10" value="' + Math.min(300, Math.max(30, Number(app.ai.timeoutSeconds) || 120)) + '" />',
             '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;">',
             '<button type="button" class="llm-btn" id="llm-test-ai">测试 AI 接口</button>',
-            '<span class="llm-muted">先检查连接、Key 和模型列表，再发送一个最多 8 tokens 的“OK”短请求；使用当前输入框内容，无需先保存，可能产生极少量 API 费用。</span>',
+            '<span class="llm-muted">先检查连接、Key 和模型列表，再发送一个最多 128 tokens 的“OK”短请求；使用当前输入框内容，无需先保存，测试最长等待 60 秒，可能产生少量 API 费用。</span>',
             '</div>',
             '<div id="llm-ai-test-result" class="llm-muted" style="margin-top:8px;line-height:1.7;"></div>',
             '</div>',
@@ -2690,9 +2753,14 @@
                 const chat = result.chat;
                 if (chat) {
                     const chatDiagnostic = formatAiDiagnostics(chat.diagnostics);
-                    if (chat.ok) {
+                    if (chat.ok && chat.partial) {
+                        const reasoningSummary = sanitizeAiDiagnosticText(chat.reasoning, 160);
+                        lines.push('<span style="color:#e3b341;">② 短消息请求已到达模型，但没有最终文本</span>：' + escapeHtml(chat.error || '仅有推理内容') + '；' + escapeHtml(chatDiagnostic));
+                        if (reasoningSummary) lines.push('推理内容摘要：' + escapeHtml(reasoningSummary));
+                        lines.push('<strong style="color:#e3b341;">结论：Endpoint、API Key 和模型路由均已连通；当前模型或代理没有产生标准最终文本。请检查结束原因和响应结构，必要时提高输出上限或调整代理兼容格式。</strong>');
+                    } else if (chat.ok) {
                         lines.push('<span style="color:#3fb950;">② 短消息测试成功</span>：模型返回“' + escapeHtml(sanitizeAiDiagnosticText(chat.content, 80)) + '”；' + escapeHtml(chatDiagnostic));
-                        lines.push('<strong style="color:#3fb950;">结论：Endpoint、API Key 和模型路由均可用。此前长正文超时更可能是处理时间超过 30 秒。</strong>');
+                        lines.push('<strong style="color:#3fb950;">结论：Endpoint、API Key、模型路由和返回格式均可用。此前长正文超时更可能是正式复核处理时间超过原来的 30 秒。</strong>');
                     } else {
                         const advice = explainAiDiagnostics(chat.diagnostics);
                         lines.push('<span style="color:#f85149;">② 短消息测试失败：' + escapeHtml(chat.error || '未知错误') + '</span>');
@@ -2740,7 +2808,8 @@
                     model: bodyContent.querySelector('[data-ai-model]').value.trim(),
                     apiKey: bodyContent.querySelector('[data-ai-key]').value.trim(),
                     runOnFirstCheck: bodyContent.querySelector('[data-ai-first-check]').checked,
-                    maxExcerptChars: Math.min(MAX_AI_EXCERPT_CHARS, Math.max(3000, Number(bodyContent.querySelector('[data-ai-max-chars]').value) || 14000))
+                    maxExcerptChars: Math.min(MAX_AI_EXCERPT_CHARS, Math.max(3000, Number(bodyContent.querySelector('[data-ai-max-chars]').value) || 14000)),
+                    timeoutSeconds: Math.min(300, Math.max(30, Number(bodyContent.querySelector('[data-ai-timeout]').value) || 120))
                 },
                 currency: {
                     display: bodyContent.querySelector('[data-currency-display]').value,
