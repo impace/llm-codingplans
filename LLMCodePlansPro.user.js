@@ -227,7 +227,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.9.1';
+    const APP_VERSION = '2.10.0';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -2169,11 +2169,16 @@
         if (hasBuiltin) {
             return {
                 kind: row.capacityMode === 'official-token' ? 'official-token' : 'builtin-credit',
-                minB: builtin,
-                baseB: builtin,
-                maxB: builtin,
+                minB: row.capacityMode === 'official-token' ? builtin : NaN,
+                baseB: row.capacityMode === 'official-token' ? builtin : NaN,
+                maxB: row.capacityMode === 'official-token' ? builtin : NaN,
+                creditValue: row.capacityMode === 'official-token' ? NaN : builtin,
+                creditUnit: row.capacityMode === 'official-token' ? '' : 'B Credits',
+                creditWindow: row.capacityMode === 'official-token' ? '' : '月',
                 confidence: row.capacityMode === 'official-token' ? 'high' : 'medium',
-                label: '内置基准 ' + builtin.toFixed(2) + 'B',
+                label: row.capacityMode === 'official-token'
+                    ? '内置 Token 月容量 ' + builtin.toFixed(2) + 'B'
+                    : '内置 ' + builtin.toFixed(2) + 'B Credits/月',
                 evidence: row.evidence,
                 sourceUrl: '',
                 checkedAt: ''
@@ -2181,14 +2186,16 @@
         }
         if (requests.length) {
             const item = requests[0];
-            const toB = tokens => item.monthlyRequests * tokens / 1000000000;
             return {
-                kind: 'estimated-requests',
-                minB: toB(REQUEST_TOKEN_SCENARIOS.conservative),
-                baseB: toB(REQUEST_TOKEN_SCENARIOS.baseline),
-                maxB: toB(REQUEST_TOKEN_SCENARIOS.optimistic),
+                kind: 'requests',
+                minB: NaN,
+                baseB: NaN,
+                maxB: NaN,
+                requestCountMonthly: item.monthlyRequests,
+                requestUnit: item.unit,
+                requestWindow: item.window,
                 confidence: 'low',
-                label: '按 ' + Math.round(item.monthlyRequests).toLocaleString() + ' 次/月自动估算',
+                label: Math.round(item.monthlyRequests).toLocaleString() + ' 次/月（不折算 Token）',
                 evidence: (item.historical ? '沿用上次成功 AI 结果；' : '') + (item.evidence || (item.value + ' ' + item.unit + '/' + item.window)),
                 sourceUrl: item.sourceUrl,
                 checkedAt: item.checkedAt
@@ -2201,8 +2208,11 @@
                 minB: NaN,
                 baseB: NaN,
                 maxB: NaN,
+                creditValue: item.value,
+                creditUnit: item.unit,
+                creditWindow: item.window,
                 confidence: 'relative',
-                label: item.value.toLocaleString() + ' ' + item.unit + '/' + item.window + '（无官方 Token 换算）',
+                label: item.value.toLocaleString() + ' ' + item.unit + '/' + item.window + '（不折算 Token）',
                 evidence: (item.historical ? '沿用上次成功 AI 结果；' : '') + item.evidence,
                 sourceUrl: item.sourceUrl,
                 checkedAt: item.checkedAt
@@ -2213,14 +2223,16 @@
             const value = Number(requestMatch[1].replace(/,/g, ''));
             const multiplier = monthlyMultiplier(requestMatch[2]);
             const monthlyRequests = value * multiplier;
-            const toB = tokens => monthlyRequests * tokens / 1000000000;
             return {
-                kind: 'estimated-requests',
-                minB: toB(REQUEST_TOKEN_SCENARIOS.conservative),
-                baseB: toB(REQUEST_TOKEN_SCENARIOS.baseline),
-                maxB: toB(REQUEST_TOKEN_SCENARIOS.optimistic),
+                kind: 'requests',
+                minB: NaN,
+                baseB: NaN,
+                maxB: NaN,
+                requestCountMonthly: monthlyRequests,
+                requestUnit: '次',
+                requestWindow: requestMatch[2],
                 confidence: 'low',
-                label: '按内置官方额度 ' + Math.round(monthlyRequests).toLocaleString() + ' 次/月自动估算',
+                label: '官方额度 ' + Math.round(monthlyRequests).toLocaleString() + ' 次/月（不折算 Token）',
                 evidence: row.bottleneck,
                 sourceUrl: '',
                 checkedAt: ''
@@ -2233,8 +2245,11 @@
                 minB: NaN,
                 baseB: NaN,
                 maxB: NaN,
+                creditValue: Number(relativeMatch[1].replace(/,/g, '')),
+                creditUnit: relativeMatch[2],
+                creditWindow: relativeMatch[3],
                 confidence: 'relative',
-                label: Number(relativeMatch[1].replace(/,/g, '')).toLocaleString() + ' ' + relativeMatch[2] + '/' + relativeMatch[3] + '（无官方 Token 换算）',
+                label: Number(relativeMatch[1].replace(/,/g, '')).toLocaleString() + ' ' + relativeMatch[2] + '/' + relativeMatch[3] + '（不折算 Token）',
                 evidence: row.bottleneck,
                 sourceUrl: '',
                 checkedAt: ''
@@ -2516,6 +2531,61 @@
         #llm-modal .llm-settings-label { display: block; margin-top: 8px; color: var(--llm-text-dim); font-size: 11px; }
         #llm-modal .llm-source-status { font-size: 11px; margin-top: 5px; line-height: 1.4; }
         #llm-modal .llm-muted { color: var(--llm-text-dim); font-size: 11px; line-height: 1.5; }
+        #llm-modal .llm-calc-hero {
+            display: flex; justify-content: space-between; align-items: flex-start; gap: 14px;
+            background: linear-gradient(135deg, rgba(56,139,253,.18), rgba(35,134,54,.12));
+            border: 1px solid rgba(88,166,255,.28); border-radius: 14px; padding: 16px; margin-bottom: 12px;
+        }
+        #llm-modal .llm-calc-kicker { color: #79c0ff; font-size: 11px; margin-bottom: 4px; }
+        #llm-modal .llm-calc-hero h2 { margin: 0; font-size: 18px; }
+        #llm-modal .llm-calc-hero p { margin: 7px 0 0; color: var(--llm-text-dim); font-size: 12px; line-height: 1.6; }
+        #llm-modal .llm-calc-overview {
+            display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px;
+        }
+        #llm-modal .llm-summary-card {
+            min-width: 0; background: var(--llm-card); border: 1px solid var(--llm-border);
+            border-radius: 10px; padding: 11px 12px;
+        }
+        #llm-modal .llm-summary-card span { display: block; color: var(--llm-text-dim); font-size: 11px; }
+        #llm-modal .llm-summary-card strong { display: block; margin: 5px 0 3px; font-size: 16px; overflow-wrap: anywhere; }
+        #llm-modal .llm-summary-card small { color: var(--llm-text-dim); font-size: 10px; }
+        #llm-modal .llm-summary-token { border-color: rgba(63,185,80,.4); }
+        #llm-modal .llm-summary-request { border-color: rgba(88,166,255,.4); }
+        #llm-modal .llm-summary-other { border-color: rgba(210,153,34,.4); }
+        #llm-modal .llm-summary-foot { grid-column: 1 / -1; color: var(--llm-text-dim); font-size: 11px; padding: 2px 3px; }
+        #llm-modal .llm-plan-legend { display: flex; flex-wrap: wrap; gap: 7px 14px; color: var(--llm-text-dim); font-size: 11px; margin: 5px 2px 12px; }
+        #llm-modal .llm-plan-section { margin: 0 0 14px; }
+        #llm-modal .llm-plan-section-head {
+            display: flex; justify-content: space-between; align-items: flex-start; gap: 10px;
+            padding: 10px 12px; border-radius: 10px 10px 0 0; background: rgba(255,255,255,.045);
+            border: 1px solid var(--llm-border); border-bottom: 0;
+        }
+        #llm-modal .llm-plan-section-head h3 { margin: 0; font-size: 14px; }
+        #llm-modal .llm-plan-section-head p { margin: 4px 0 0; color: var(--llm-text-dim); font-size: 11px; line-height: 1.5; }
+        #llm-modal .llm-plan-section-head > span { color: var(--llm-text-dim); font-size: 11px; white-space: nowrap; }
+        #llm-modal .llm-plan-card {
+            background: var(--llm-card); border: 1px solid var(--llm-border); border-top: 0;
+            padding: 12px; margin: 0;
+        }
+        #llm-modal .llm-plan-card:last-child { border-radius: 0 0 10px 10px; }
+        #llm-modal .llm-plan-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+        #llm-modal .llm-plan-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 13px; font-weight: 600; }
+        #llm-modal .llm-plan-title span { overflow-wrap: anywhere; }
+        #llm-modal .llm-plan-price { color: #dbeafe; font-size: 12px; text-align: right; white-space: nowrap; }
+        #llm-modal .llm-plan-metrics { display: grid; grid-template-columns: 1fr 1fr 130px; gap: 8px; margin-top: 10px; }
+        #llm-modal .llm-plan-metrics > div { background: rgba(0,0,0,.16); border-radius: 7px; padding: 7px 8px; min-width: 0; }
+        #llm-modal .llm-plan-metrics span { display: block; color: var(--llm-text-dim); font-size: 10px; }
+        #llm-modal .llm-plan-metrics strong { display: block; margin-top: 3px; font-size: 12px; overflow-wrap: anywhere; }
+        #llm-modal .llm-plan-metrics input { width: 58px; margin-top: 3px; padding: 4px 5px; }
+        #llm-modal .llm-plan-metrics em { color: var(--llm-text-dim); font-style: normal; font-size: 11px; margin-left: 3px; }
+        #llm-modal .llm-plan-note { color: #c9d1d9; font-size: 11px; margin-top: 9px; line-height: 1.5; }
+        #llm-modal .llm-plan-evidence { color: var(--llm-text-dim); font-size: 10px; line-height: 1.5; margin-top: 3px; }
+        #llm-modal .llm-empty-state { color: var(--llm-text-dim); border: 1px solid var(--llm-border); border-radius: 0 0 10px 10px; padding: 12px; font-size: 11px; }
+        @media (max-width: 700px) {
+            #llm-modal .llm-calc-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            #llm-modal .llm-plan-metrics { grid-template-columns: 1fr 1fr; }
+            #llm-modal .llm-plan-metrics > div:last-child { grid-column: 1 / -1; }
+        }
     `;
 
     const styleEl = document.createElement('style');
@@ -2777,7 +2847,7 @@
         bodyContent.querySelector('#llm-radar-refresh').addEventListener('click', renderRadar);
     }
 
-    // ======================== 6. 单账号极限基准 + 自选购物车大盘 ========================
+    // ======================== 6. 分类测算 + 自选购物车 ========================
     function renderCalc() {
         const settings = readAppSettings();
         const rates = parseFxRates(settings.currency.rates);
@@ -2785,170 +2855,158 @@
         const rows = getCartRows();
         const providers = new Map(getAllProviders().map(provider => [provider.id, provider]));
         const capacityProfiles = buildCapacityProfiles(rows, providers);
-        const apiOptions = API_COST_PROFILES.map(profile => '<option value="' + escapeHtml(profile.id) + '"' + (cart.apiMode === profile.id ? ' selected' : '') + '>' + escapeHtml(profile.name) + '</option>').join('');
+
+        const categoryOf = (row, capacity) => {
+            const price = getAccountPrice(row, rates);
+            if (!Number.isFinite(price.cny)) return 'incomplete';
+            if (capacity?.kind === 'official-token') return 'token';
+            if (capacity?.kind === 'requests') return 'requests';
+            if (capacity?.kind === 'relative-credit' || capacity?.kind === 'builtin-credit') return 'credits';
+            return 'incomplete';
+        };
+        const categoryMeta = {
+            token: { title: 'Token 方案', subtitle: '有明确 Token 月容量，才进入 Token 总量和单位成本计算。', icon: '🟩' },
+            requests: { title: '请求次数方案', subtitle: '只比较价格和请求次数；不把一次请求擅自换算成 Token。', icon: '🟦' },
+            credits: { title: 'Credits / 积分方案', subtitle: '保留厂商自己的额度单位；没有官方换算规则就不折算 Token。', icon: '🟨' },
+            incomplete: { title: '信息不完整', subtitle: '套餐仍然保留，但缺少可靠价格、额度或抓取结果，不参与性价比计算。', icon: '⬜' }
+        };
         const formatDefaultPrice = row => {
             const price = getAccountPrice(row, rates);
             if (!Number.isFinite(price.cny)) return '价格未知';
-            return escapeHtml(currencySymbol(price.currency) + Number(price.amount).toFixed(2) + ' ≈ ¥' + price.cny.toFixed(2));
+            return currencySymbol(price.currency) + Number(price.amount).toFixed(2) + ' ≈ ¥' + price.cny.toFixed(2) + '/月';
         };
-        const rowHtml = rows.map(row => {
+        const formatCapacity = capacity => {
+            if (capacity?.kind === 'official-token' && Number.isFinite(capacity.baseB)) return capacity.baseB.toFixed(2) + 'B Token/月';
+            if (capacity?.kind === 'requests' && Number.isFinite(capacity.requestCountMonthly)) return Math.round(capacity.requestCountMonthly).toLocaleString() + ' 次/月';
+            if ((capacity?.kind === 'relative-credit' || capacity?.kind === 'builtin-credit') && capacity.label) return capacity.label;
+            return '暂无可靠额度';
+        };
+        const formatUnitCost = (row, capacity) => {
+            const price = getAccountPrice(row, rates);
+            if (!Number.isFinite(price.cny)) return '价格未知';
+            if (capacity?.kind === 'official-token' && Number(capacity.baseB) > 0) return '¥' + (price.cny / capacity.baseB).toFixed(2) + '/B Token';
+            if (capacity?.kind === 'requests' && Number(capacity.requestCountMonthly) > 0) return '¥' + (price.cny / capacity.requestCountMonthly * 1000).toFixed(2) + '/千次';
+            return '不计算单位成本';
+        };
+        const rowHtml = (row, capacity, category) => {
             const provider = providers.get(row.providerId) || { name: row.providerId };
             const quantity = Math.floor(Math.max(0, Number(cart.quantities[row.id]) || 0));
-            const capacity = capacityProfiles.get(row.id);
-            const hasCapacity = Number.isFinite(capacity?.baseB);
-            const defaultCapacity = hasCapacity
-                ? (capacity.kind === 'estimated-requests'
-                    ? capacity.baseB.toFixed(2) + 'B（' + capacity.minB.toFixed(2) + '～' + capacity.maxB.toFixed(2) + 'B）'
-                    : capacity.baseB.toFixed(2) + 'B')
-                : (capacity?.kind === 'relative-credit' ? '不可折算 B' : '暂无数据');
-            const baselinePrice = getAccountPrice(row, rates);
-            const unitCost = Number.isFinite(baselinePrice.cny) && Number(capacity?.baseB) > 0 ? '；基准约 ¥' + (baselinePrice.cny / capacity.baseB).toFixed(2) + '/B' : '';
-            const modeLabel = capacity?.kind === 'official-token'
-                ? '官方 Token 月容量'
-                : capacity?.kind === 'estimated-requests'
-                    ? '请求次数自动估算（8K / 32K / 100K Token/次）'
-                    : capacity?.kind === 'relative-credit'
-                        ? '官方 Credits/积分，无公开 Token 换算'
-                        : capacity?.kind === 'builtin-credit'
-                            ? '内置官方标称 B，口径需核实'
-                            : '尚无可折算容量';
+            const price = getAccountPrice(row, rates);
+            const priceText = formatDefaultPrice(row);
+            const capacityText = formatCapacity(capacity);
+            const unitCostText = formatUnitCost(row, capacity);
+            const sourceText = capacity?.evidence || row.evidence || row.bottleneck || '暂无来源说明';
+            const missingText = !Number.isFinite(price.cny) && category === 'incomplete'
+                ? '价格未取得；'
+                : !Number.isFinite(price.cny) ? '价格未知；' : '';
             return [
-                '<div class="llm-settings-row" data-cart-row="' + escapeHtml(row.id) + '">',
-                '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">',
-                '<label style="font-size:13px;font-weight:600;min-width:0;">',
-                '<input type="checkbox" data-cart-check ' + (quantity > 0 ? 'checked' : '') + ' /> ',
-                escapeHtml(provider.name) + ' · ' + escapeHtml(row.plan),
-                '<span class="llm-muted" style="margin-left:6px;">' + formatDefaultPrice(row) + '</span>',
-                '</label>',
-                '<span class="llm-muted" style="text-align:right;">单账号容量：' + escapeHtml(defaultCapacity + unitCost) + '</span>',
+                '<div class="llm-plan-card" data-cart-row="' + escapeHtml(row.id) + '">',
+                '<div class="llm-plan-card-head">',
+                '<label class="llm-plan-title"><input type="checkbox" data-cart-check ' + (quantity > 0 ? 'checked' : '') + ' /> <span>' + escapeHtml(provider.name) + ' · ' + escapeHtml(row.plan) + '</span></label>',
+                '<span class="llm-plan-price">' + escapeHtml(priceText) + '</span>',
                 '</div>',
-                '<div class="llm-muted" style="margin-top:8px;">购买数量 <input class="llm-input-num" style="width:76px;" type="number" min="0" step="1" data-cart-quantity value="' + quantity + '" /> 个；' + escapeHtml(modeLabel) + '；短板：' + escapeHtml(row.bottleneck) + '</div>',
-                '<div class="llm-muted" style="margin-top:3px;">自动容量依据：' + escapeHtml(capacity?.label || '暂无') + '；证据：' + escapeHtml(capacity?.evidence || row.evidence) + (capacity?.checkedAt ? '；更新于 ' + escapeHtml(formatDate(capacity.checkedAt)) : '') + '</div>',
+                '<div class="llm-plan-metrics">',
+                '<div><span>单账号额度</span><strong>' + escapeHtml(capacityText) + '</strong></div>',
+                '<div><span>单位成本</span><strong>' + escapeHtml(unitCostText) + '</strong></div>',
+                '<div><span>购买数量</span><input class="llm-input-num" type="number" min="0" step="1" data-cart-quantity value="' + quantity + '" /><em>个</em></div>',
+                '</div>',
+                '<div class="llm-plan-note">' + escapeHtml(missingText + (capacity?.label || row.bottleneck || '暂无额度说明')) + '</div>',
+                '<div class="llm-plan-evidence">依据：' + escapeHtml(sourceText) + (capacity?.checkedAt ? '；更新于 ' + escapeHtml(formatDate(capacity.checkedAt)) : '') + '</div>',
                 '</div>'
             ].join('');
-        }).join('');
+        };
+        const sectionHtml = (category, rowsInCategory) => {
+            const meta = categoryMeta[category];
+            const cards = rowsInCategory.map(row => rowHtml(row, capacityProfiles.get(row.id), category)).join('');
+            return [
+                '<section class="llm-plan-section llm-plan-section-' + category + '">',
+                '<div class="llm-plan-section-head"><div><h3>' + meta.icon + ' ' + meta.title + '</h3><p>' + meta.subtitle + '</p></div><span>' + rowsInCategory.length + ' 个方案</span></div>',
+                cards || '<div class="llm-empty-state">当前没有符合条件的方案。</div>',
+                '</section>'
+            ].join('');
+        };
+        const grouped = { token: [], requests: [], credits: [], incomplete: [] };
+        rows.forEach(row => grouped[categoryOf(row, capacityProfiles.get(row.id))].push(row));
 
         bodyContent.innerHTML = [
-            '<div class="llm-calc-box">',
-            '<div style="font-weight:600;margin-bottom:10px;font-size:14px;">🧮 单账号极限基准 + 自选购物车大盘</div>',
-            '<div class="llm-muted" style="line-height:1.7;">这里只需要勾选账号并填写购买数量。系统自动读取雷达/AI 的最新官方额度：明确 Token 值直接按周期换算；请求次数按统一编码负载生成保守、基准、乐观区间；Credits/积分没有官方换算公式时保留为相对额度，不伪造 Token。</div>',
-            '<div class="llm-muted" style="line-height:1.7;margin-top:6px;">操作：每行勾选 = 纳入购物车，购买数量 = 买几个。上面的目标月用量（默认 20B）只是大盘对比目标；API 兜底基准只用于缺口和纯 API 参考，不是账号购买数量。</div>',
-            '<div class="llm-input-group" style="margin-top:12px;"><span>目标月用量：</span><span><input type="number" id="calc-target-b" class="llm-input-num" min="0.01" step="0.1" value="' + cart.targetB + '" /> B Token</span></div>',
-            '<div class="llm-input-group"><span>闲时/夜间占比：</span><span><input type="number" id="calc-night-percent" class="llm-input-num" min="0" max="100" step="1" value="' + cart.nightPercent + '" /> %</span></div>',
-            '<div class="llm-input-group"><span>API 兜底基准：</span><span><select id="calc-api-mode" style="background:rgba(0,0,0,.35);border:1px solid var(--llm-border);color:#fff;padding:6px;border-radius:6px;">' + apiOptions + '</select></span></div>',
-            '<div class="llm-input-group"><span>自定义 API 成本（仅选自定义时生效）：</span><span><input type="number" id="calc-custom-api-cost" class="llm-input-num" min="0" step="0.01" value="' + cart.customApiCost + '" /> ¥ / B Token</span></div>',
-            '<div class="llm-muted">API 兜底只用于“已知容量不足”的缺口估算，不会把未知订阅伪装成有容量。当前口径：输入缓存/未命中、输出占比分别由代码基准给出；如你的模型和输入输出比例不同，请选“自定义”覆盖。</div>',
+            '<div class="llm-calc-hero">',
+            '<div><div class="llm-calc-kicker">🧮 订阅方案测算</div><h2>单账号能力 + 自选购物车</h2><p>这里只做两件事：勾选要买的套餐，再填写买几个。Token、请求次数、Credits/积分分开统计，不互相硬换算。</p></div>',
+            '<button class="llm-btn" id="llm-clear-cart">清空购物车</button>',
             '</div>',
-            '<div style="font-size:13px;font-weight:600;margin:8px 0;">① 单账号极限基准（可勾选，不自动排序或替你购买）</div>',
-            '<div id="llm-cart-list">' + (rowHtml || '<div class="llm-card">当前没有启用的厂商账号，请先到“厂商配置”启用。</div>') + '</div>',
-            '<div style="font-size:13px;font-weight:600;margin:14px 0 8px;">② 自选购物车大盘</div>',
-            '<div id="llm-calc-summary"></div>',
-            '<div style="margin-top:8px;"><button class="llm-btn" id="llm-clear-cart">清空购物车勾选与数量</button></div>'
+            '<div id="llm-calc-summary" class="llm-calc-overview"></div>',
+            '<div class="llm-plan-legend"><span>🟩 可计入 Token 总量</span><span>🟦 单独比较请求次数</span><span>🟨 保留 Credits/积分</span><span>⬜ 信息不完整</span></div>',
+            '<div class="llm-plan-sections">',
+            sectionHtml('token', grouped.token),
+            sectionHtml('requests', grouped.requests),
+            sectionHtml('credits', grouped.credits),
+            sectionHtml('incomplete', grouped.incomplete),
+            '</div>'
         ].join('');
 
         const readDomCart = () => {
             const next = readCalcCart();
-            next.targetB = Math.max(0.01, Number(document.getElementById('calc-target-b').value) || 20);
-            next.nightPercent = Math.min(100, Math.max(0, Number(document.getElementById('calc-night-percent').value) || 0));
-            next.apiMode = document.getElementById('calc-api-mode').value;
-            next.customApiCost = Math.max(0, Number(document.getElementById('calc-custom-api-cost').value) || 0);
             next.quantities = {};
             bodyContent.querySelectorAll('[data-cart-row]').forEach(rowEl => {
                 const id = rowEl.getAttribute('data-cart-row');
                 const quantity = Math.floor(Math.max(0, Number(rowEl.querySelector('[data-cart-quantity]').value) || 0));
-                const checked = rowEl.querySelector('[data-cart-check]').checked;
-                next.quantities[id] = checked ? quantity : 0;
+                next.quantities[id] = rowEl.querySelector('[data-cart-check]').checked ? quantity : 0;
             });
             saveCalcCart(next);
             return next;
         };
-
         const recalculate = () => {
             const current = readDomCart();
-            const apiCostPerB = calculateApiCostPerB(current.apiMode, current.nightPercent, current.customApiCost);
-            const selected = [];
-            let totalAccounts = 0;
-            let subscriptionCost = 0;
-            let unknownPriceCount = 0;
-            let unknownCapacityCount = 0;
-            let relativeCapacityCount = 0;
-            let conservativeCapacity = 0;
-            let baselineCapacity = 0;
-            let optimisticCapacity = 0;
+            const totals = {
+                accounts: 0,
+                monthlyCost: 0,
+                unknownPriceAccounts: 0,
+                tokenB: 0,
+                tokenCost: 0,
+                tokenUnknownPrice: 0,
+                requestCount: 0,
+                requestCost: 0,
+                requestUnknownPrice: 0,
+                creditPlans: 0,
+                incompletePlans: 0
+            };
             rows.forEach(row => {
                 const quantity = Math.floor(Math.max(0, Number(current.quantities[row.id]) || 0));
                 if (!quantity) return;
-                const price = getAccountPrice(row, rates);
                 const capacity = capacityProfiles.get(row.id);
-                const provider = providers.get(row.providerId) || { name: row.providerId };
-                totalAccounts += quantity;
-                if (Number.isFinite(price.cny)) subscriptionCost += price.cny * quantity;
-                else unknownPriceCount += quantity;
-                if (Number.isFinite(capacity?.baseB)) {
-                    conservativeCapacity += capacity.minB * quantity;
-                    baselineCapacity += capacity.baseB * quantity;
-                    optimisticCapacity += capacity.maxB * quantity;
-                } else {
-                    unknownCapacityCount += quantity;
-                    if (capacity?.kind === 'relative-credit') relativeCapacityCount += quantity;
-                }
-                selected.push({ row, provider, quantity, price, capacity });
+                const price = getAccountPrice(row, rates);
+                const category = categoryOf(row, capacity);
+                totals.accounts += quantity;
+                if (Number.isFinite(price.cny)) totals.monthlyCost += price.cny * quantity;
+                else totals.unknownPriceAccounts += quantity;
+                if (category === 'token' && Number.isFinite(capacity.baseB)) {
+                    totals.tokenB += capacity.baseB * quantity;
+                    if (Number.isFinite(price.cny)) totals.tokenCost += price.cny * quantity;
+                    else totals.tokenUnknownPrice += quantity;
+                } else if (category === 'requests' && Number.isFinite(capacity.requestCountMonthly)) {
+                    totals.requestCount += capacity.requestCountMonthly * quantity;
+                    if (Number.isFinite(price.cny)) totals.requestCost += price.cny * quantity;
+                    else totals.requestUnknownPrice += quantity;
+                } else if (category === 'credits') totals.creditPlans += quantity;
+                else if (category === 'incomplete') totals.incompletePlans += quantity;
             });
-            const targetB = current.targetB;
-            const conservativeCoverage = targetB > 0 ? conservativeCapacity / targetB : 0;
-            const baselineCoverage = targetB > 0 ? baselineCapacity / targetB : 0;
-            const optimisticCoverage = targetB > 0 ? optimisticCapacity / targetB : 0;
-            const conservativeGapB = Math.max(0, targetB - conservativeCapacity);
-            const baselineGapB = Math.max(0, targetB - baselineCapacity);
-            const optimisticGapB = Math.max(0, targetB - optimisticCapacity);
-            const pureApiCost = targetB * apiCostPerB;
-            const hasUnknownPrice = unknownPriceCount > 0;
-            const hasUnknownCapacity = unknownCapacityCount > 0;
-            const fallbackCost = baselineGapB * apiCostPerB;
-            const effectiveCost = hasUnknownPrice ? NaN : subscriptionCost + fallbackCost;
-            const savings = Number.isFinite(effectiveCost) ? pureApiCost - effectiveCost : NaN;
-            const selectedHtml = selected.length ? selected.map(item => {
-                const capText = Number.isFinite(item.capacity?.baseB)
-                    ? (item.capacity.baseB * item.quantity).toFixed(2) + 'B 基准（' + (item.capacity.minB * item.quantity).toFixed(2) + '～' + (item.capacity.maxB * item.quantity).toFixed(2) + 'B）'
-                    : (item.capacity?.kind === 'relative-credit' ? item.capacity.label + '，不计入 B 汇总' : '暂无可折算容量');
-                const priceText = Number.isFinite(item.price.cny) ? formatCny(item.price.cny * item.quantity) : '待定';
-                return '<div class="llm-rank-item"><div><strong>' + escapeHtml(item.provider.name) + ' · ' + escapeHtml(item.row.plan) + '</strong><div class="llm-muted">' + item.quantity + ' 个账号；容量 ' + escapeHtml(capText) + '；订阅费 ' + escapeHtml(priceText) + '</div></div><div class="llm-muted" style="text-align:right;">' + escapeHtml(item.capacity?.label || item.row.bottleneck) + '</div></div>';
-            }).join('') : '<div class="llm-card">购物车为空。请在上方勾选账号并设置数量。</div>';
-            const warnings = [];
-            if (hasUnknownCapacity) warnings.push('有 ' + unknownCapacityCount + ' 个账号没有可折算 Token 容量' + (relativeCapacityCount ? '，其中 ' + relativeCapacityCount + ' 个只有 Credits/积分相对额度' : '') + '；它们不计入 B 汇总，但不会阻断其他账号的基准测算');
-            if (hasUnknownPrice) warnings.push('有 ' + unknownPriceCount + ' 个账号没有可换算价格，总成本暂不闭合；请更新脚本内的价格基准');
-            if (current.apiMode === 'custom' && current.customApiCost <= 0) warnings.push('你选择了自定义 API 单价，但当前是 0；请填写真实的 ¥/B Token');
-            const costText = Number.isFinite(effectiveCost) ? formatCny(effectiveCost) : '待定';
-            const savingsText = Number.isFinite(savings) ? formatCny(savings) + '（' + (pureApiCost > 0 ? (savings / pureApiCost * 100).toFixed(1) : '0.0') + '%）' : '待定';
+            const tokenCostText = totals.tokenB > 0 && totals.tokenUnknownPrice === 0 ? '¥' + (totals.tokenCost / totals.tokenB).toFixed(2) + '/B' : '待定';
+            const requestCostText = totals.requestCount > 0 && totals.requestUnknownPrice === 0 ? '¥' + (totals.requestCost / totals.requestCount * 1000).toFixed(2) + '/千次' : '待定';
             document.getElementById('llm-calc-summary').innerHTML = [
-                '<div class="llm-card">',
-                '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">',
-                '<div><div class="llm-muted">已选账号</div><strong>' + totalAccounts + ' 个</strong></div>',
-                '<div><div class="llm-muted">保守 / 基准 / 乐观容量</div><strong>' + conservativeCapacity.toFixed(2) + ' / ' + baselineCapacity.toFixed(2) + ' / ' + optimisticCapacity.toFixed(2) + 'B</strong></div>',
-                '<div><div class="llm-muted">三档目标达成率</div><strong>' + (conservativeCoverage * 100).toFixed(1) + '% / ' + (baselineCoverage * 100).toFixed(1) + '% / ' + (optimisticCoverage * 100).toFixed(1) + '%</strong></div>',
-                '<div><div class="llm-muted">三档容量缺口</div><strong>' + conservativeGapB.toFixed(2) + ' / ' + baselineGapB.toFixed(2) + ' / ' + optimisticGapB.toFixed(2) + 'B</strong></div>',
-                '<div><div class="llm-muted">订阅月费（已知价格）</div><strong>' + formatCny(subscriptionCost) + '</strong></div>',
-                '<div><div class="llm-muted">API 兜底缺口成本（基准）</div><strong>' + formatCny(fallbackCost) + '</strong></div>',
-                '<div><div class="llm-muted">购物车有效月成本（基准）</div><strong>' + escapeHtml(costText) + '</strong></div>',
-                '<div><div class="llm-muted">纯 API 基准</div><strong>' + formatCny(pureApiCost) + '</strong></div>',
-                '<div><div class="llm-muted">相对纯 API 节省</div><strong>' + escapeHtml(savingsText) + '</strong></div>',
-                '</div>',
-                '<div style="margin-top:10px;"><strong>本次购物车</strong>' + selectedHtml + '</div>',
-                (warnings.length ? '<div class="llm-highlight-promo">⚠️ ' + escapeHtml(warnings.join('；')) + '</div>' : ''),
-                '<div class="llm-muted">说明：明确 Token 额度按官方周期折算；请求次数按每次 8K / 32K / 100K Token 生成保守、基准、乐观区间。Credits、积分、相对倍数在没有官方换算公式时不折算成 Token。系统不会自动挑选、分配或购买账号；未知价格不按 0 计算。</div>',
-                '</div>'
+                '<div class="llm-summary-card"><span>已选账号</span><strong>' + totals.accounts + ' 个</strong><small>只统计你勾选并填写数量的方案</small></div>',
+                '<div class="llm-summary-card llm-summary-token"><span>Token 方案</span><strong>' + totals.tokenB.toFixed(2) + 'B</strong><small>单位成本：' + tokenCostText + '</small></div>',
+                '<div class="llm-summary-card llm-summary-request"><span>请求次数方案</span><strong>' + Math.round(totals.requestCount).toLocaleString() + ' 次/月</strong><small>单位成本：' + requestCostText + '</small></div>',
+                '<div class="llm-summary-card llm-summary-other"><span>Credits / 信息不完整</span><strong>' + totals.creditPlans + ' / ' + totals.incompletePlans + ' 个</strong><small>不计入 Token 总量</small></div>',
+                '<div class="llm-summary-foot">已选方案月费：' + (totals.unknownPriceAccounts ? '部分价格未知，暂无法闭合' : formatCny(totals.monthlyCost)) + '。不同计量单位不会混加。</div>'
             ].join('');
         };
 
-        bodyContent.querySelectorAll('input, select').forEach(element => {
-            if (element.getAttribute('data-cart-check') !== null) return;
-            element.addEventListener('input', recalculate);
-            element.addEventListener('change', recalculate);
+        bodyContent.querySelectorAll('[data-cart-quantity]').forEach(input => {
+            input.addEventListener('input', recalculate);
+            input.addEventListener('change', recalculate);
         });
         bodyContent.querySelectorAll('[data-cart-check]').forEach(check => {
             check.addEventListener('change', () => {
-                const row = check.closest('[data-cart-row]');
-                const quantity = row?.querySelector('[data-cart-quantity]');
+                const quantity = check.closest('[data-cart-row]')?.querySelector('[data-cart-quantity]');
                 if (!quantity) return;
                 if (check.checked && Number(quantity.value) <= 0) quantity.value = '1';
                 if (!check.checked) quantity.value = '0';
