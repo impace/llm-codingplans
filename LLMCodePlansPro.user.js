@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.10.0
+// @version      2.11.0
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -154,6 +154,9 @@
                     { title: 'Token Plan 说明 1', url: 'https://cloud.tencent.com/document/product/1823/130060' },
                     { title: 'Token Plan 说明 2', url: 'https://cloud.tencent.com/document/product/1823/131172' }
                 ],
+                rules: [
+                    { title: '积分用量抵扣规则', url: 'https://cloud.tencent.com/document/product/1823/133811' }
+                ],
                 updates: [
                     { title: '更新公告 1', url: 'https://cloud.tencent.com/document/product/1823/130675' },
                     { title: '更新公告 2', url: 'https://cloud.tencent.com/document/product/1823/130758' }
@@ -227,14 +230,14 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.10.0';
+    const APP_VERSION = '2.11.0';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
     const RENDER_REQUEST_KEY_PREFIX = 'llm_render_request_v1_';
     const AI_SNAPSHOT_KEY_PREFIX = 'llm_ai_snapshot_v1_';
     const CALC_CART_KEY = 'llm_calc_cart_v1';
-    const SETTINGS_SCHEMA_VERSION = 3;
+    const SETTINGS_SCHEMA_VERSION = 4;
     const MAX_PROBE_BYTES = 500000;
     const MAX_AI_EXCERPT_CHARS = 18000;
     const REQUEST_TOKEN_SCENARIOS = {
@@ -382,6 +385,7 @@
             verifiedAt: String(s.verifiedAt || '未核验').trim(),
             links: {
                 pricing: Array.isArray(s.links?.pricing) ? s.links.pricing : [],
+                rules: Array.isArray(s.links?.rules) ? s.links.rules : [],
                 updates: Array.isArray(s.links?.updates) ? s.links.updates : []
             }
         };
@@ -392,9 +396,10 @@
         const savedLinks = savedProvider?.links || {};
         const links = {
             pricing: provider.links.pricing.map(l => ({ ...l })),
+            rules: provider.links.rules.map(l => ({ ...l })),
             updates: provider.links.updates.map(l => ({ ...l }))
         };
-        ['pricing', 'updates'].forEach(type => {
+        ['pricing', 'rules', 'updates'].forEach(type => {
             if (!Array.isArray(savedLinks[type])) return;
             const custom = savedLinks[type]
                 .filter(l => l && isHttpUrl(l.url))
@@ -451,6 +456,25 @@
     function saveProviderSettings(settings) {
         settings.__schemaVersion = SETTINGS_SCHEMA_VERSION;
         GM_setValue(PROVIDER_SETTINGS_KEY, settings);
+    }
+
+    const PROVIDER_COLORS = {
+        deepseek: '#4f8cff', bailian: '#ff8a3d', volcengine: '#6c63ff', qianfan: '#4aa3df',
+        copilot: '#a371f7', zhipu: '#27ae60', tencent: '#18a6d9', mimo: '#ff6b81',
+        kimi: '#f0a13a', openai: '#10a37f', grok: '#9aa4b2'
+    };
+
+    function providerColor(providerId) {
+        return PROVIDER_COLORS[String(providerId || '').trim()] || '#58a6ff';
+    }
+
+    function planTone(plan) {
+        const value = String(plan || '').toLowerCase();
+        if (/max|ultra|heavy/.test(value)) return 0.92;
+        if (/pro\+|pro/.test(value)) return 0.72;
+        if (/standard|plus/.test(value)) return 0.54;
+        if (/lite|free|go/.test(value)) return 0.38;
+        return 0.62;
     }
 
     function mergeSettings(base, override) {
@@ -2020,7 +2044,7 @@
     }
 
     function getProviderAiSnapshot(provider) {
-        const links = [...getUsableLinks(provider, 'pricing'), ...getUsableLinks(provider, 'updates')];
+        const links = [...getUsableLinks(provider, 'pricing'), ...getUsableLinks(provider, 'rules'), ...getUsableLinks(provider, 'updates')];
         const snapshots = links.map(link => GM_getValue(aiSnapshotKey(link.url), null)).filter(Boolean);
         snapshots.sort((a, b) => String(b.checkedAt || '').localeCompare(String(a.checkedAt || '')));
         return snapshots[0] || null;
@@ -2101,7 +2125,7 @@
     }
 
     function collectProviderAiData(provider) {
-        const links = [...getUsableLinks(provider, 'pricing'), ...getUsableLinks(provider, 'updates')];
+        const links = [...getUsableLinks(provider, 'pricing'), ...getUsableLinks(provider, 'rules'), ...getUsableLinks(provider, 'updates')];
         return links
             .map(link => {
                 const snapshot = GM_getValue(aiSnapshotKey(link.url), null);
@@ -2567,6 +2591,11 @@
             background: var(--llm-card); border: 1px solid var(--llm-border); border-top: 0;
             padding: 12px; margin: 0;
         }
+        #llm-modal .llm-plan-card { border-left: 3px solid var(--provider-color, #58a6ff); }
+        #llm-modal .llm-plan-card:nth-child(4n+1) { background: color-mix(in srgb, var(--provider-color, #58a6ff) 7%, var(--llm-card)); }
+        #llm-modal .llm-plan-card::before { content: ''; display: block; height: 2px; width: calc(var(--plan-tone, .6) * 100%); background: var(--provider-color, #58a6ff); opacity: .85; margin: -12px -12px 10px -9px; }
+        #llm-modal .llm-provider-card { border-top: 3px solid var(--provider-color, #58a6ff); }
+        #llm-modal .llm-provider-source-card { border-left: 3px solid var(--provider-color, #58a6ff); }
         #llm-modal .llm-plan-card:last-child { border-radius: 0 0 10px 10px; }
         #llm-modal .llm-plan-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
         #llm-modal .llm-plan-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 13px; font-weight: 600; }
@@ -2674,19 +2703,20 @@
         `;
         providers.forEach(p => {
             const pricingLinks = getUsableLinks(p, 'pricing');
+            const rulesLinks = getUsableLinks(p, 'rules');
             const updateLinks = getUsableLinks(p, 'updates');
             const kw = [p.name, p.models, p.category, p.tag, p.plans, p.promos, p.traps].join(' ');
             const aiSnapshot = getProviderAiSnapshot(p);
             const aiSnapshotText = formatProviderAiStatus(aiSnapshot);
             html += `
-                <div class="llm-card" data-kw="${escapeHtml(kw)}">
+                <div class="llm-card llm-provider-card" data-provider-id="${escapeHtml(p.id)}" data-kw="${escapeHtml(kw)}" style="--provider-color:${providerColor(p.id)};">
                     <div class="llm-card-header">
                         <div class="llm-provider-name">
                             <span>${escapeHtml(p.name)}</span>
                             <span class="llm-provider-tag">${escapeHtml(p.tag)}</span>
                             <span style="font-size: 11px; color: var(--llm-text-dim);">(${escapeHtml(p.category)})</span>
                         </div>
-                        <div style="font-weight: 600; color: #58a6ff; font-size: 13px; text-align: right; max-width: 55%;">${escapeHtml(p.plans)}</div>
+                        <div style="font-weight: 600; color: var(--provider-color); font-size: 13px; text-align: right; max-width: 55%;">${escapeHtml(p.plans)}</div>
                     </div>
                     <div class="llm-grid-details">
                         <div><strong>📦 额度规则：</strong>${escapeHtml(p.quotaDesc)}</div>
@@ -2698,6 +2728,7 @@
                     ${aiSnapshotText ? '<div class="llm-highlight-promo">🤖 ' + escapeHtml(aiSnapshotText) + '</div>' : ''}
                     <div class="llm-card-links">
                         ${pricingLinks.map(l => `<a href="${safeHref(l.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip">💳 ${escapeHtml(l.title)}</a>`).join('')}
+                        ${rulesLinks.map(l => `<a href="${safeHref(l.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip" style="background: rgba(210,153,34,0.18); color: #e3b341;">📐 ${escapeHtml(l.title)}</a>`).join('')}
                         ${updateLinks.map(l => `<a href="${safeHref(l.url)}" target="_blank" rel="noopener noreferrer" class="llm-link-chip" style="background: rgba(35,134,54,0.18); color: #3fb950;">📢 ${escapeHtml(l.title)}</a>`).join('')}
                     </div>
                 </div>
@@ -2720,21 +2751,21 @@
         let html = `
             <div style="display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;">
                 <button class="llm-btn" id="llm-probe-all" title="依次联网抓取全部启用的定价与更新来源，不自动调用 AI">① 全量抓取检查</button>
-                <button class="llm-btn" id="llm-probe-pricing" title="只联网抓取定价/套餐来源，不检查更新公告，也不自动调用 AI">② 仅抓取定价</button>
+                <button class="llm-btn" id="llm-probe-pricing" title="只联网抓取定价与额度/扣费规则来源，不检查更新公告，也不自动调用 AI">② 仅抓取定价/规则</button>
                 <button class="llm-btn" id="llm-radar-refresh" title="只重新渲染本地已保存状态，不发起网络请求">③ 刷新本地状态</button>
             </div>
             <div class="llm-card" style="margin-bottom: 12px;">
                 <div style="font-size: 12px; line-height: 1.7;">
                     <strong>雷达操作说明</strong><br>
                     ① <strong>全量抓取检查</strong>：逐个抓取所有定价和更新来源；适合完整巡检，速度较慢，不自动调用 AI。<br>
-                    ② <strong>仅抓取定价</strong>：只抓取价格/套餐来源；适合优先核对成本，不自动调用 AI。<br>
+                    ② <strong>仅抓取定价/规则</strong>：只抓取价格/套餐和额度/扣费规则来源；适合优先核对成本与额度，不自动调用 AI。<br>
                     ③ <strong>刷新本地状态</strong>：不联网，只重新显示已保存结果。每条来源的“抓取检查”默认只采集；打开配置中的自动开关后，仅在首次取得完整正文或完整正文发生变化时自动调用 AI；“AI重新抓取复核”会重新取正文并先做完整性校验，不需要先点“抓取检查”。未通过校验时不会发送 AI 请求。<br>
                     <span class="llm-muted">AI 复核状态会单独提示：黄色“建议点击”=正文完整且值得复核；灰色“可选”=当前无需重复点；绿色“已完成/历史结果”=已有对应正文版本的 AI 结果；红色“未执行/暂不可执行”=正文不完整、抓取失败或 AI 未配置。调用失败时，来源详情会显示脱敏诊断并可一键复制；不会包含 API Key、请求正文或完整响应。AI 结果只作证据辅助，不会自动覆盖厂商主数据。</span>
                 </div>
             </div>
         `;
         providers.forEach(p => {
-            [...getUsableLinks(p, 'pricing').map(l => ({ ...l, kind: 'pricing' })), ...getUsableLinks(p, 'updates').map(l => ({ ...l, kind: 'updates' }))].forEach(up => {
+            [...getUsableLinks(p, 'pricing').map(l => ({ ...l, kind: 'pricing' })), ...getUsableLinks(p, 'rules').map(l => ({ ...l, kind: 'rules' })), ...getUsableLinks(p, 'updates').map(l => ({ ...l, kind: 'updates' }))].forEach(up => {
                 const key = `llm_view_${p.id}_${encodeURIComponent(up.title)}`;
                 const last = GM_getValue(key, '未读');
                 const lastProbe = GM_getValue(sourceKey(up.url), null);
@@ -2743,10 +2774,10 @@
                 const aiButtonLabel = aiReviewState.kind === 'action' ? '建议 AI复核' : 'AI重新抓取复核';
                 const aiButtonStyle = aiReviewState.kind === 'action' ? ' style="border-color:#d29922;"' : '';
                 html += `
-                    <div class="llm-settings-row" data-source-card="${escapeHtml(up.url)}">
+                    <div class="llm-settings-row llm-provider-source-card" data-source-card="${escapeHtml(up.url)}" style="--provider-color:${providerColor(p.id)};">
                         <div style="display: flex; justify-content: space-between; gap: 10px; align-items: flex-start;">
                             <div style="min-width: 0;">
-                                <div style="font-size: 13px;"><strong style="color: #58a6ff;">[${escapeHtml(p.name)}]</strong> <span class="llm-muted">${up.kind === 'pricing' ? '定价' : '更新'}</span> ${escapeHtml(up.title)}</div>
+                                <div style="font-size: 13px;"><strong style="color: var(--provider-color);">[${escapeHtml(p.name)}]</strong> <span class="llm-muted">${up.kind === 'pricing' ? '定价' : (up.kind === 'rules' ? '规则' : '更新')}</span> ${escapeHtml(up.title)}</div>
                                 <div style="font-size: 11px; color: var(--llm-text-dim); margin-top: 3px;">上次打开：${escapeHtml(last)}</div>
                                 <div class="llm-source-status" data-source-status style="color: ${summary.color};">来源检查：${escapeHtml(summary.label)}</div>
                                 <div class="llm-source-status" data-ai-review-state style="color: ${aiReviewState.color};">${escapeHtml(aiReviewState.label)}</div>
@@ -2841,7 +2872,7 @@
         });
 
         bodyContent.querySelector('#llm-probe-pricing').addEventListener('click', e => {
-            runBatch(e.currentTarget, '.llm-probe-one[data-kind="pricing"]');
+            runBatch(e.currentTarget, '.llm-probe-one[data-kind="pricing"], .llm-probe-one[data-kind="rules"]');
         });
 
         bodyContent.querySelector('#llm-radar-refresh').addEventListener('click', renderRadar);
@@ -2890,6 +2921,7 @@
         };
         const rowHtml = (row, capacity, category) => {
             const provider = providers.get(row.providerId) || { name: row.providerId };
+            const tone = planTone(row.plan);
             const quantity = Math.floor(Math.max(0, Number(cart.quantities[row.id]) || 0));
             const price = getAccountPrice(row, rates);
             const priceText = formatDefaultPrice(row);
@@ -2900,7 +2932,7 @@
                 ? '价格未取得；'
                 : !Number.isFinite(price.cny) ? '价格未知；' : '';
             return [
-                '<div class="llm-plan-card" data-cart-row="' + escapeHtml(row.id) + '">',
+                '<div class="llm-plan-card" data-cart-row="' + escapeHtml(row.id) + '" style="--provider-color:' + escapeHtml(providerColor(row.providerId)) + ';--plan-tone:' + tone + '">',
                 '<div class="llm-plan-card-head">',
                 '<label class="llm-plan-title"><input type="checkbox" data-cart-check ' + (quantity > 0 ? 'checked' : '') + ' /> <span>' + escapeHtml(provider.name) + ' · ' + escapeHtml(row.plan) + '</span></label>',
                 '<span class="llm-plan-price">' + escapeHtml(priceText) + '</span>',
@@ -3065,12 +3097,16 @@
         ].join('');
         providers.forEach(provider => {
             const pricing = getUsableLinks(provider, 'pricing');
+            const rules = getUsableLinks(provider, 'rules');
             const updates = getUsableLinks(provider, 'updates');
             html += [
                 '<div class="llm-settings-row" data-provider-settings="' + escapeHtml(provider.id) + '">',
                 '<label style="font-size:13px;font-weight:600;"><input type="checkbox" data-provider-enabled ' + (provider.enabled ? 'checked' : '') + ' /> ' + escapeHtml(provider.name) + ' <span class="llm-muted">(' + escapeHtml(provider.category) + ')</span></label>',
                 '<label class="llm-settings-label">定价/套餐地址（每行：标题 | URL）</label>',
                 '<textarea data-links="pricing">' + escapeHtml(pricing.map(link => link.title + ' | ' + link.url).join('\n')) + '</textarea>',
+                '<label class="llm-settings-label">额度/扣费规则地址（每行：标题 | URL）</label>',
+                '<div class="llm-muted">用于积分扣费、模型倍率、缓存价格或按模型 Token 预估等规则；不是让你手工填写公式。</div>',
+                '<textarea data-links="rules">' + escapeHtml(rules.map(link => link.title + ' | ' + link.url).join('\n')) + '</textarea>',
                 '<label class="llm-settings-label">更新/公告地址（每行：标题 | URL）</label>',
                 '<textarea data-links="updates">' + escapeHtml(updates.map(link => link.title + ' | ' + link.url).join('\n')) + '</textarea>',
                 '</div>'
@@ -3161,6 +3197,7 @@
                     enabled: row.querySelector('[data-provider-enabled]').checked,
                     links: {
                         pricing: parseLinkLines(row.querySelector('[data-links="pricing"]').value),
+                        rules: parseLinkLines(row.querySelector('[data-links="rules"]').value),
                         updates: parseLinkLines(row.querySelector('[data-links="updates"]').value)
                     }
                 };
