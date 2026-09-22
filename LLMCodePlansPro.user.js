@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.11.0
+// @version      2.12.0
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.11.0';
+    const APP_VERSION = '2.12.0';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -2588,17 +2588,18 @@
         #llm-modal .llm-plan-section-head p { margin: 4px 0 0; color: var(--llm-text-dim); font-size: 11px; line-height: 1.5; }
         #llm-modal .llm-plan-section-head > span { color: var(--llm-text-dim); font-size: 11px; white-space: nowrap; }
         #llm-modal .llm-plan-card {
-            background: var(--llm-card); border: 1px solid var(--llm-border); border-top: 0;
+            background: color-mix(in srgb, var(--provider-color, #58a6ff) 5%, var(--llm-card)); border: 1px solid var(--llm-border); border-top: 0;
             padding: 12px; margin: 0;
         }
-        #llm-modal .llm-provider-card { border-top: 1px solid color-mix(in srgb, var(--provider-color, #58a6ff) 55%, var(--llm-border)); }
-        #llm-modal .llm-provider-source-card { border-left: 2px solid color-mix(in srgb, var(--provider-color, #58a6ff) 60%, var(--llm-border)); }
+        #llm-modal .llm-provider-card { border-top: 2px solid var(--provider-color, #58a6ff); }
+        #llm-modal .llm-provider-source-card { background: var(--llm-card); }
         #llm-modal .llm-plan-card:last-child { border-radius: 0 0 10px 10px; }
         #llm-modal .llm-plan-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
         #llm-modal .llm-plan-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 13px; font-weight: 600; }
         #llm-modal .llm-plan-title span { overflow-wrap: anywhere; }
-        #llm-modal .llm-provider-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; background: var(--provider-color, #58a6ff); box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-color, #58a6ff) 18%, transparent); }
-        #llm-modal .llm-plan-badge { display: inline-block; padding: 2px 6px; border-radius: 5px; font-size: 10px; line-height: 1.2; color: #eef6ff; background: color-mix(in srgb, var(--provider-color, #58a6ff) calc(var(--plan-tone, .6) * 100%), #202832); border: 1px solid color-mix(in srgb, var(--provider-color, #58a6ff) 45%, transparent); white-space: nowrap; }
+        #llm-modal .llm-provider-dot { display: none; }
+        #llm-modal .llm-plan-badge { display: inline-block; padding: 2px 6px; border-radius: 5px; font-size: 10px; line-height: 1.2; color: color-mix(in srgb, var(--provider-color, #58a6ff) 75%, #fff); background: color-mix(in srgb, var(--provider-color, #58a6ff) 14%, #202832); border: 1px solid color-mix(in srgb, var(--provider-color, #58a6ff) 35%, transparent); white-space: nowrap; }
+        #llm-modal .llm-provider-label { color: var(--provider-color, #58a6ff); }
         #llm-modal .llm-plan-price { color: #dbeafe; font-size: 12px; text-align: right; white-space: nowrap; }
         #llm-modal .llm-plan-metrics { display: grid; grid-template-columns: 1fr 1fr 130px; gap: 8px; margin-top: 10px; }
         #llm-modal .llm-plan-metrics > div { background: rgba(0,0,0,.16); border-radius: 7px; padding: 7px 8px; min-width: 0; }
@@ -2933,7 +2934,7 @@
             return [
                 '<div class="llm-plan-card" data-cart-row="' + escapeHtml(row.id) + '" style="--provider-color:' + escapeHtml(providerColor(row.providerId)) + ';--plan-tone:' + tone + '">',
                 '<div class="llm-plan-card-head">',
-                '<label class="llm-plan-title"><input type="checkbox" data-cart-check ' + (quantity > 0 ? 'checked' : '') + ' /> <i class="llm-provider-dot" aria-hidden="true"></i><span>' + escapeHtml(provider.name) + '</span><span class="llm-plan-badge">' + escapeHtml(row.plan) + '</span></label>',
+                '<label class="llm-plan-title"><input type="checkbox" data-cart-check ' + (quantity > 0 ? 'checked' : '') + ' /> <span class="llm-provider-label">' + escapeHtml(provider.name) + '</span><span class="llm-plan-badge">' + escapeHtml(row.plan) + '</span></label>',
                 '<span class="llm-plan-price">' + escapeHtml(priceText) + '</span>',
                 '</div>',
                 '<div class="llm-plan-metrics">',
