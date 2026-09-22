@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.13.0
+// @version      2.14.0
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.13.0';
+    const APP_VERSION = '2.14.0';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -254,7 +254,8 @@
             apiKey: '',
             runOnFirstCheck: false,
             maxExcerptChars: 14000,
-            timeoutSeconds: 120
+            timeoutSeconds: 120,
+            testTimeoutSeconds: 120
         },
         currency: {
             display: 'CNY',
@@ -658,7 +659,7 @@
                     ok: false,
                     status: 0,
                     responseText: '',
-                    error: '请求超时（' + Math.round(timeout / 1000) + '秒）',
+                    error: '浏览器端请求超时（' + Math.round(timeout / 1000) + '秒）；请求已被本地取消，代理可能记录 HTTP 499/context canceled',
                     diagnostics: buildAiDiagnostics(endpoint, model, phase + '超时', { elapsedMs: Date.now() - startedAt })
                 })
             });
@@ -669,6 +670,7 @@
         const endpoint = String(config?.endpoint || '').trim();
         const model = String(config?.model || '').trim();
         const apiKey = String(config?.apiKey || '').trim();
+        const testTimeoutSeconds = Math.min(300, Math.max(30, Number(config?.testTimeoutSeconds) || 120));
         if (!isHttpUrl(endpoint)) return { ok: false, validationError: 'Endpoint 不是有效的 HTTP(S) 地址' };
         if (!model) return { ok: false, validationError: '请填写模型名' };
         if (!apiKey) return { ok: false, validationError: '请填写 API Key' };
@@ -704,7 +706,7 @@
             endpoint,
             model,
             apiKey,
-            timeout: 60000,
+            timeout: testTimeoutSeconds * 1000,
             phase: '短消息测试',
             data: {
                 model,
@@ -745,7 +747,7 @@
                 chat.diagnostics.phase = '短消息响应解析';
             }
         }
-        return { ok: chat.ok, models, chat, stoppedAfterModels: false };
+        return { ok: chat.ok, models, chat, stoppedAfterModels: false, testTimeoutSeconds };
     }
 
     function saveAiSnapshot(url, snapshot) {
@@ -3149,9 +3151,10 @@
             '<label class="llm-settings-label"><input type="checkbox" data-ai-first-check ' + (app.ai.runOnFirstCheck ? 'checked' : '') + ' /> 普通“抓取检查”在首次取得完整正文或完整正文发生变化时自动调用 AI（会产生 API 费用）</label>',
             '<label class="llm-settings-label">送入 AI 的最大正文字符数</label><input type="number" data-ai-max-chars min="3000" max="' + MAX_AI_EXCERPT_CHARS + '" step="500" value="' + Number(app.ai.maxExcerptChars || 14000) + '" />',
             '<label class="llm-settings-label">正式 AI 复核超时（秒）</label><input type="number" data-ai-timeout min="30" max="300" step="10" value="' + Math.min(300, Math.max(30, Number(app.ai.timeoutSeconds) || 120)) + '" />',
+            '<label class="llm-settings-label">AI 接口短消息测试超时（秒）</label><input type="number" data-ai-test-timeout min="30" max="300" step="10" value="' + Math.min(300, Math.max(30, Number(app.ai.testTimeoutSeconds) || 120)) + '" />',
             '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;">',
             '<button type="button" class="llm-btn" id="llm-test-ai">测试 AI 接口</button>',
-            '<span class="llm-muted">先检查连接、Key 和模型列表，再发送一个最多 128 tokens 的“OK”短请求；使用当前输入框内容，无需先保存，测试最长等待 60 秒，可能产生少量 API 费用。</span>',
+            '<span class="llm-muted">先检查连接、Key 和模型列表，再发送一个最多 128 tokens 的“OK”短请求；短消息测试超时与正式复核分开设置。若浏览器先超时取消，CPA 可能记录 HTTP 499/context canceled。</span>',
             '</div>',
             '<div id="llm-ai-test-result" class="llm-muted" style="margin-top:8px;line-height:1.7;"></div>',
             '</div>',
@@ -3200,7 +3203,8 @@
             button.textContent = '测试中…';
             resultBox.innerHTML = '<span style="color:#e3b341;">正在检查模型列表与认证…</span>';
             try {
-                const result = await testAiConnection({ endpoint, model, apiKey });
+                const testTimeoutSeconds = Math.min(300, Math.max(30, Number(bodyContent.querySelector('[data-ai-test-timeout]').value) || 120));
+                const result = await testAiConnection({ endpoint, model, apiKey, testTimeoutSeconds });
                 if (result.validationError) {
                     resultBox.innerHTML = '<span style="color:#f85149;">测试未执行：' + escapeHtml(result.validationError) + '</span>';
                     return;
@@ -3242,6 +3246,9 @@
                         const advice = explainAiDiagnostics(chat.diagnostics);
                         lines.push('<span style="color:#f85149;">② 短消息测试失败：' + escapeHtml(chat.error || '未知错误') + '</span>');
                         lines.push('诊断：' + escapeHtml(chatDiagnostic));
+                        if (chat.status === 499 || /context canceled|client closed request/i.test(String(chat.error || ''))) {
+                            lines.push('<strong style="color:#e3b341;">判断：CPA/反向代理返回了 HTTP 499，表示上游请求被取消。若诊断耗时接近浏览器端测试超时，通常是浏览器先取消；若明显早于测试超时，则重点检查 CPA 的上游超时、模型路由和代理日志。</strong>');
+                        }
                         if (advice) lines.push('初步判断：' + escapeHtml(advice));
                         if (chat.status === 0 && /超时/.test(String(chat.diagnostics?.phase || ''))) {
                             const gatewayConclusion = models?.ok
@@ -3287,7 +3294,8 @@
                     apiKey: bodyContent.querySelector('[data-ai-key]').value.trim(),
                     runOnFirstCheck: bodyContent.querySelector('[data-ai-first-check]').checked,
                     maxExcerptChars: Math.min(MAX_AI_EXCERPT_CHARS, Math.max(3000, Number(bodyContent.querySelector('[data-ai-max-chars]').value) || 14000)),
-                    timeoutSeconds: Math.min(300, Math.max(30, Number(bodyContent.querySelector('[data-ai-timeout]').value) || 120))
+                    timeoutSeconds: Math.min(300, Math.max(30, Number(bodyContent.querySelector('[data-ai-timeout]').value) || 120)),
+                    testTimeoutSeconds: Math.min(300, Math.max(30, Number(bodyContent.querySelector('[data-ai-test-timeout]').value) || 120))
                 },
                 currency: {
                     display: bodyContent.querySelector('[data-currency-display]').value,
