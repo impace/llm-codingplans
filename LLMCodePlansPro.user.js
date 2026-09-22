@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.12.0
+// @version      2.13.0
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.12.0';
+    const APP_VERSION = '2.13.0';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -975,6 +975,20 @@
                 evidence: String(row.evidence || '').trim().slice(0, 300)
             };
         }) : [];
+        const modelEstimates = Array.isArray(source.modelEstimates) ? source.modelEstimates.slice(0, 120).map(item => {
+            const row = item && typeof item === 'object' ? item : {};
+            const numericValue = Number(row.estimatedTokens ?? row.value);
+            return {
+                plan: String(row.plan || '未标注套餐').trim().slice(0, 120),
+                model: String(row.model || row.modelName || '未标注模型').trim().slice(0, 160),
+                modelId: String(row.modelId || '').trim().slice(0, 160),
+                estimatedTokens: Number.isFinite(numericValue) ? numericValue : String(row.estimatedTokens ?? row.value ?? '').trim().slice(0, 80),
+                estimatedUnit: String(row.estimatedUnit || row.unit || 'unknown').trim().slice(0, 40),
+                window: String(row.window || 'monthly').trim().slice(0, 30),
+                basis: String(row.basis || '页面估算').trim().slice(0, 120),
+                evidence: String(row.evidence || '').trim().slice(0, 300)
+            };
+        }).filter(item => item.model && item.estimatedTokens !== '') : [];
         return {
             confidence,
             needsReview: source.needsReview !== false,
@@ -982,6 +996,7 @@
             pageCurrency: normalizeCurrencyCode(source.pageCurrency),
             prices,
             quotas,
+            modelEstimates,
             models: Array.isArray(source.models) ? source.models.map(v => String(v).trim()).filter(Boolean).slice(0, 40) : [],
             warnings: Array.isArray(source.warnings) ? source.warnings.map(v => String(v).trim()).filter(Boolean).slice(0, 20) : []
         };
@@ -1032,6 +1047,7 @@
             '额度的 value 与 unit 必须共同保留数量级：例如 100M Tokens 返回 value=100、unit="M tokens"，11B Tokens 返回 value=11、unit="B tokens"；不要把 M/B 丢掉。',
             'window 必须保留原始周期并尽量标准化为 monthly、weekly、daily、5h 等；同一套餐有月度和滚动窗口双重限制时，两项都要返回。',
             'Credits、积分、请求数和消息数不能猜测为 Token；分别使用 credits、points、requests、messages 等单位。',
+            '如果页面提供“模型 × 套餐档位”的 Token 用量预估，必须单独放入 modelEstimates；这是按模型估算，不是固定套餐 Token，不要把不同模型相加。',
             '必须只返回 JSON，不要 Markdown 代码围栏。JSON 字段：',
             JSON.stringify({
                 confidence: 'high|medium|low',
@@ -1040,6 +1056,7 @@
                 pageCurrency: 'USD|EUR|GBP|JPY|CNY|HKD|KRW|UNKNOWN',
                 prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', amountCny: 0, evidence: '原文短证据' }],
                 quotas: [{ plan: '套餐名', value: 0, unit: 'tokens|K tokens|M tokens|B tokens|requests|messages|credits|points|unknown', window: '5h|daily|weekly|monthly|unknown', evidence: '原文短证据' }],
+                modelEstimates: [{ plan: '套餐档位', model: '模型名称', modelId: 'Model ID', estimatedTokens: 0, estimatedUnit: 'tokens|K tokens|万 tokens|M tokens|B tokens', window: 'monthly', basis: '官方页面估算/官方规则推算', evidence: '原文短证据' }],
                 models: ['正文明确提及的模型'],
                 warnings: ['币种、地区、登录态或页面不确定性']
             }),
@@ -2094,6 +2111,7 @@
         if (/b\s*token|billion|十亿/.test(value)) return 'b-tokens';
         if (/m\s*token|million|百万/.test(value)) return 'm-tokens';
         if (/k\s*token|thousand|千/.test(value)) return 'k-tokens';
+        if (/万\s*token|ten[- ]?thousand/.test(value)) return 'wan-tokens';
         if (/token/.test(value)) return 'tokens';
         if (/request|call|message|次|请求|消息/.test(value)) return 'requests';
         if (/credit|point|积分|点数|额度点/.test(value)) return 'credits';
@@ -2120,6 +2138,7 @@
         if (kind === 'b-tokens') return amount;
         if (kind === 'm-tokens') return amount / 1000;
         if (kind === 'k-tokens') return amount / 1000000;
+        if (kind === 'wan-tokens') return amount / 100000;
         if (kind === 'tokens') return amount / 1000000000;
         return NaN;
     }
@@ -2139,9 +2158,34 @@
     function deriveQuotaCapacity(row, provider) {
         const candidates = collectProviderAiData(provider);
         const exact = [];
+        const modelEstimated = [];
         const requests = [];
         const relative = [];
         candidates.forEach(({ link, snapshot, data, historical }) => {
+            const estimates = Array.isArray(data?.modelEstimates) ? data.modelEstimates : [];
+            estimates.forEach(estimate => {
+                if (!planMatches(row.plan, estimate.plan)) return;
+                const parsed = parseQuotaValue(estimate.estimatedTokens, estimate.estimatedUnit);
+                const value = parsed.value;
+                const kind = quotaUnitKind(parsed.unit);
+                const multiplier = monthlyMultiplier(estimate.window || 'monthly');
+                const monthlyB = tokenValueToB(value, kind) * multiplier;
+                if (!Number.isFinite(monthlyB)) return;
+                modelEstimated.push({
+                    model: estimate.model,
+                    modelId: estimate.modelId,
+                    monthlyB,
+                    value,
+                    unit: parsed.unit,
+                    window: estimate.window,
+                    basis: estimate.basis,
+                    evidence: estimate.evidence,
+                    sourceUrl: link.url,
+                    checkedAt: snapshot.checkedAt || '',
+                    confidence: String(data?.confidence || 'low'),
+                    historical
+                });
+            });
             const quotas = Array.isArray(data?.quotas) ? data.quotas : [];
             quotas.forEach(quota => {
                 if (!planMatches(row.plan, quota.plan)) return;
@@ -2173,6 +2217,7 @@
         });
         // 同一套餐可能同时存在月度上限与滚动窗口上限，取折算后更严格的约束。
         exact.sort((a, b) => a.monthlyB - b.monthlyB);
+        modelEstimated.sort((a, b) => a.monthlyB - b.monthlyB);
         requests.sort((a, b) => a.monthlyRequests - b.monthlyRequests);
         if (exact.length) {
             const item = exact[0];
@@ -2184,6 +2229,21 @@
                 confidence: item.confidence === 'high' ? 'high' : 'medium',
                 label: '官方 Token 月容量 ' + item.monthlyB.toFixed(2) + 'B',
                 evidence: (item.historical ? '沿用上次成功 AI 结果；' : '') + (item.evidence || (item.value + ' ' + item.unit + '/' + item.window)),
+                sourceUrl: item.sourceUrl,
+                checkedAt: item.checkedAt
+            };
+        }
+        if (modelEstimated.length) {
+            const item = modelEstimated[0];
+            return {
+                kind: 'model-estimated-token',
+                minB: NaN,
+                baseB: NaN,
+                maxB: NaN,
+                modelEstimates: modelEstimated.slice(0, 30),
+                confidence: item.confidence === 'high' ? 'medium' : 'low',
+                label: '按模型估算（' + modelEstimated.length + ' 个模型）',
+                evidence: (item.historical ? '沿用上次成功 AI 结果；' : '') + (item.basis || item.evidence || '官方页面估算'),
                 sourceUrl: item.sourceUrl,
                 checkedAt: item.checkedAt
             };
@@ -2609,11 +2669,17 @@
         #llm-modal .llm-plan-metrics em { color: var(--llm-text-dim); font-style: normal; font-size: 11px; margin-left: 3px; }
         #llm-modal .llm-plan-note { color: #c9d1d9; font-size: 11px; margin-top: 9px; line-height: 1.5; }
         #llm-modal .llm-plan-evidence { color: var(--llm-text-dim); font-size: 10px; line-height: 1.5; margin-top: 3px; }
+        #llm-modal .llm-model-estimate-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
+        #llm-modal .llm-model-estimate-list > div { background: rgba(0,0,0,.14); border: 1px solid rgba(255,255,255,.07); border-radius: 7px; padding: 7px 8px; min-width: 0; }
+        #llm-modal .llm-model-estimate-list span { display: block; color: var(--llm-text-dim); font-size: 10px; overflow-wrap: anywhere; }
+        #llm-modal .llm-model-estimate-list strong { display: block; margin-top: 3px; font-size: 11px; }
+        #llm-modal .llm-model-estimate-list em { display: block; margin-top: 2px; color: var(--llm-text-dim); font-size: 9px; font-style: normal; }
         #llm-modal .llm-empty-state { color: var(--llm-text-dim); border: 1px solid var(--llm-border); border-radius: 0 0 10px 10px; padding: 12px; font-size: 11px; }
         @media (max-width: 700px) {
             #llm-modal .llm-calc-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             #llm-modal .llm-plan-metrics { grid-template-columns: 1fr 1fr; }
             #llm-modal .llm-plan-metrics > div:last-child { grid-column: 1 / -1; }
+            #llm-modal .llm-model-estimate-list { grid-template-columns: 1fr; }
         }
     `;
 
@@ -2891,12 +2957,14 @@
             const price = getAccountPrice(row, rates);
             if (!Number.isFinite(price.cny)) return 'incomplete';
             if (capacity?.kind === 'official-token') return 'token';
+            if (capacity?.kind === 'model-estimated-token') return 'model-estimated';
             if (capacity?.kind === 'requests') return 'requests';
             if (capacity?.kind === 'relative-credit' || capacity?.kind === 'builtin-credit') return 'credits';
             return 'incomplete';
         };
         const categoryMeta = {
             token: { title: 'Token 方案', subtitle: '有明确 Token 月容量，才进入 Token 总量和单位成本计算。', icon: '🟩' },
+            'model-estimated': { title: '按模型估算 Token', subtitle: '同一套餐按不同模型分别估算；这些数值不相加，也不是固定保证额度。', icon: '🟪' },
             requests: { title: '请求次数方案', subtitle: '只比较价格和请求次数；不把一次请求擅自换算成 Token。', icon: '🟦' },
             credits: { title: 'Credits / 积分方案', subtitle: '保留厂商自己的额度单位；没有官方换算规则就不折算 Token。', icon: '🟨' },
             incomplete: { title: '信息不完整', subtitle: '套餐仍然保留，但缺少可靠价格、额度或抓取结果，不参与性价比计算。', icon: '⬜' }
@@ -2908,6 +2976,7 @@
         };
         const formatCapacity = capacity => {
             if (capacity?.kind === 'official-token' && Number.isFinite(capacity.baseB)) return capacity.baseB.toFixed(2) + 'B Token/月';
+            if (capacity?.kind === 'model-estimated-token') return '按模型分别估算（不合并）';
             if (capacity?.kind === 'requests' && Number.isFinite(capacity.requestCountMonthly)) return Math.round(capacity.requestCountMonthly).toLocaleString() + ' 次/月';
             if ((capacity?.kind === 'relative-credit' || capacity?.kind === 'builtin-credit') && capacity.label) return capacity.label;
             return '暂无可靠额度';
@@ -2916,6 +2985,7 @@
             const price = getAccountPrice(row, rates);
             if (!Number.isFinite(price.cny)) return '价格未知';
             if (capacity?.kind === 'official-token' && Number(capacity.baseB) > 0) return '¥' + (price.cny / capacity.baseB).toFixed(2) + '/B Token';
+            if (capacity?.kind === 'model-estimated-token') return '按模型查看';
             if (capacity?.kind === 'requests' && Number(capacity.requestCountMonthly) > 0) return '¥' + (price.cny / capacity.requestCountMonthly * 1000).toFixed(2) + '/千次';
             return '不计算单位成本';
         };
@@ -2942,6 +3012,9 @@
                 '<div><span>单位成本</span><strong>' + escapeHtml(unitCostText) + '</strong></div>',
                 '<div><span>购买数量</span><input class="llm-input-num" type="number" min="0" step="1" data-cart-quantity value="' + quantity + '" /><em>个</em></div>',
                 '</div>',
+                capacity?.kind === 'model-estimated-token'
+                    ? '<div class="llm-model-estimate-list">' + capacity.modelEstimates.map(item => '<div><span>' + escapeHtml(item.model) + (item.modelId ? ' · ' + escapeHtml(item.modelId) : '') + '</span><strong>' + escapeHtml(Number(item.monthlyB).toFixed(4)) + 'B Token/月</strong><em>' + (Number.isFinite(price.cny) && Number(item.monthlyB) > 0 ? '约 ¥' + (price.cny / item.monthlyB).toFixed(2) + '/B；' : '') + escapeHtml(item.basis || '页面估算') + '</em></div>').join('') + '</div>'
+                    : '',
                 '<div class="llm-plan-note">' + escapeHtml(missingText + (capacity?.label || row.bottleneck || '暂无额度说明')) + '</div>',
                 '<div class="llm-plan-evidence">依据：' + escapeHtml(sourceText) + (capacity?.checkedAt ? '；更新于 ' + escapeHtml(formatDate(capacity.checkedAt)) : '') + '</div>',
                 '</div>'
@@ -2957,7 +3030,7 @@
                 '</section>'
             ].join('');
         };
-        const grouped = { token: [], requests: [], credits: [], incomplete: [] };
+        const grouped = { token: [], 'model-estimated': [], requests: [], credits: [], incomplete: [] };
         rows.forEach(row => grouped[categoryOf(row, capacityProfiles.get(row.id))].push(row));
 
         bodyContent.innerHTML = [
@@ -2966,9 +3039,10 @@
             '<button class="llm-btn" id="llm-clear-cart">清空购物车</button>',
             '</div>',
             '<div id="llm-calc-summary" class="llm-calc-overview"></div>',
-            '<div class="llm-plan-legend"><span>🟩 可计入 Token 总量</span><span>🟦 单独比较请求次数</span><span>🟨 保留 Credits/积分</span><span>⬜ 信息不完整</span></div>',
+                '<div class="llm-plan-legend"><span>🟩 固定 Token</span><span>🟪 按模型估算 Token</span><span>🟦 请求次数</span><span>🟨 Credits/积分</span><span>⬜ 信息不完整</span></div>',
             '<div class="llm-plan-sections">',
             sectionHtml('token', grouped.token),
+            sectionHtml('model-estimated', grouped['model-estimated']),
             sectionHtml('requests', grouped.requests),
             sectionHtml('credits', grouped.credits),
             sectionHtml('incomplete', grouped.incomplete),
@@ -2998,6 +3072,7 @@
                 requestCount: 0,
                 requestCost: 0,
                 requestUnknownPrice: 0,
+                modelEstimatedPlans: 0,
                 creditPlans: 0,
                 incompletePlans: 0
             };
@@ -3018,7 +3093,8 @@
                     totals.requestCount += capacity.requestCountMonthly * quantity;
                     if (Number.isFinite(price.cny)) totals.requestCost += price.cny * quantity;
                     else totals.requestUnknownPrice += quantity;
-                } else if (category === 'credits') totals.creditPlans += quantity;
+                } else if (category === 'model-estimated') totals.modelEstimatedPlans += quantity;
+                else if (category === 'credits') totals.creditPlans += quantity;
                 else if (category === 'incomplete') totals.incompletePlans += quantity;
             });
             const tokenCostText = totals.tokenB > 0 && totals.tokenUnknownPrice === 0 ? '¥' + (totals.tokenCost / totals.tokenB).toFixed(2) + '/B' : '待定';
@@ -3027,7 +3103,7 @@
                 '<div class="llm-summary-card"><span>已选账号</span><strong>' + totals.accounts + ' 个</strong><small>只统计你勾选并填写数量的方案</small></div>',
                 '<div class="llm-summary-card llm-summary-token"><span>Token 方案</span><strong>' + totals.tokenB.toFixed(2) + 'B</strong><small>单位成本：' + tokenCostText + '</small></div>',
                 '<div class="llm-summary-card llm-summary-request"><span>请求次数方案</span><strong>' + Math.round(totals.requestCount).toLocaleString() + ' 次/月</strong><small>单位成本：' + requestCostText + '</small></div>',
-                '<div class="llm-summary-card llm-summary-other"><span>Credits / 信息不完整</span><strong>' + totals.creditPlans + ' / ' + totals.incompletePlans + ' 个</strong><small>不计入 Token 总量</small></div>',
+                '<div class="llm-summary-card llm-summary-other"><span>按模型估算 / Credits / 不完整</span><strong>' + totals.modelEstimatedPlans + ' / ' + totals.creditPlans + ' / ' + totals.incompletePlans + ' 个</strong><small>估算值不合并 Token 总量</small></div>',
                 '<div class="llm-summary-foot">已选方案月费：' + (totals.unknownPriceAccounts ? '部分价格未知，暂无法闭合' : formatCny(totals.monthlyCost)) + '。不同计量单位不会混加。</div>'
             ].join('');
         };
