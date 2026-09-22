@@ -2591,15 +2591,14 @@
             background: var(--llm-card); border: 1px solid var(--llm-border); border-top: 0;
             padding: 12px; margin: 0;
         }
-        #llm-modal .llm-plan-card { border-left: 3px solid var(--provider-color, #58a6ff); }
-        #llm-modal .llm-plan-card:nth-child(4n+1) { background: color-mix(in srgb, var(--provider-color, #58a6ff) 7%, var(--llm-card)); }
-        #llm-modal .llm-plan-card::before { content: ''; display: block; height: 2px; width: calc(var(--plan-tone, .6) * 100%); background: var(--provider-color, #58a6ff); opacity: .85; margin: -12px -12px 10px -9px; }
-        #llm-modal .llm-provider-card { border-top: 3px solid var(--provider-color, #58a6ff); }
-        #llm-modal .llm-provider-source-card { border-left: 3px solid var(--provider-color, #58a6ff); }
+        #llm-modal .llm-provider-card { border-top: 1px solid color-mix(in srgb, var(--provider-color, #58a6ff) 55%, var(--llm-border)); }
+        #llm-modal .llm-provider-source-card { border-left: 2px solid color-mix(in srgb, var(--provider-color, #58a6ff) 60%, var(--llm-border)); }
         #llm-modal .llm-plan-card:last-child { border-radius: 0 0 10px 10px; }
         #llm-modal .llm-plan-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
         #llm-modal .llm-plan-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 13px; font-weight: 600; }
         #llm-modal .llm-plan-title span { overflow-wrap: anywhere; }
+        #llm-modal .llm-provider-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; background: var(--provider-color, #58a6ff); box-shadow: 0 0 0 2px color-mix(in srgb, var(--provider-color, #58a6ff) 18%, transparent); }
+        #llm-modal .llm-plan-badge { display: inline-block; padding: 2px 6px; border-radius: 5px; font-size: 10px; line-height: 1.2; color: #eef6ff; background: color-mix(in srgb, var(--provider-color, #58a6ff) calc(var(--plan-tone, .6) * 100%), #202832); border: 1px solid color-mix(in srgb, var(--provider-color, #58a6ff) 45%, transparent); white-space: nowrap; }
         #llm-modal .llm-plan-price { color: #dbeafe; font-size: 12px; text-align: right; white-space: nowrap; }
         #llm-modal .llm-plan-metrics { display: grid; grid-template-columns: 1fr 1fr 130px; gap: 8px; margin-top: 10px; }
         #llm-modal .llm-plan-metrics > div { background: rgba(0,0,0,.16); border-radius: 7px; padding: 7px 8px; min-width: 0; }
@@ -2934,7 +2933,7 @@
             return [
                 '<div class="llm-plan-card" data-cart-row="' + escapeHtml(row.id) + '" style="--provider-color:' + escapeHtml(providerColor(row.providerId)) + ';--plan-tone:' + tone + '">',
                 '<div class="llm-plan-card-head">',
-                '<label class="llm-plan-title"><input type="checkbox" data-cart-check ' + (quantity > 0 ? 'checked' : '') + ' /> <span>' + escapeHtml(provider.name) + ' · ' + escapeHtml(row.plan) + '</span></label>',
+                '<label class="llm-plan-title"><input type="checkbox" data-cart-check ' + (quantity > 0 ? 'checked' : '') + ' /> <i class="llm-provider-dot" aria-hidden="true"></i><span>' + escapeHtml(provider.name) + '</span><span class="llm-plan-badge">' + escapeHtml(row.plan) + '</span></label>',
                 '<span class="llm-plan-price">' + escapeHtml(priceText) + '</span>',
                 '</div>',
                 '<div class="llm-plan-metrics">',
