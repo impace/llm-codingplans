@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.14.4
+// @version      2.14.5
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.14.4';
+    const APP_VERSION = '2.14.5';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -2226,18 +2226,21 @@
             : '';
         const stateText = aiFailed ? '' : effectiveStatus;
         const parts = [];
+        let reviewPanel = '';
+        let diagnosticPanel = '';
         const reviewStatus = getAiReviewStatus(snapshot, Boolean(displayProbe.aiExtraction));
         const aiData = displayProbe.aiExtraction || snapshot?.data || null;
         const reviewUrl = resolvedUrl;
+        const reviewButton = (action, label, className = '') => '<button type="button" class="llm-btn llm-ai-review-action ' + className + '" data-ai-review-action="' + action + '" data-ai-review-url="' + escapeHtml(reviewUrl) + '">' + label + '</button>';
         if (aiData) {
             const label = displayProbe.aiReused || displayProbe.notModified ? '同一正文版本的历史 AI 结果：' : '本次 AI 结果：';
             parts.push(label + escapeHtml(formatAiSnapshot({ data: aiData })));
             if (reviewStatus === 'pending') {
-                parts.push('<span style="color:#e3b341;">AI结果待确认，当前未用于测算</span> <button type="button" class="llm-btn llm-ai-review-action" data-ai-review-action="confirm" data-ai-review-url="' + escapeHtml(reviewUrl) + '" style="font-size:11px;padding:2px 7px;border-color:#3fb950;">确认并应用</button> <button type="button" class="llm-btn llm-ai-review-action" data-ai-review-action="ignore" data-ai-review-url="' + escapeHtml(reviewUrl) + '" style="font-size:11px;padding:2px 7px;">忽略结果</button>');
+                reviewPanel = '<div class="llm-ai-review-panel llm-ai-review-pending"><strong class="llm-ai-review-heading">这份 AI 结果还没有用于测算</strong><div>核对上面的识别内容后，确认才会把它纳入购物车测算。</div><div class="llm-ai-review-actions">' + reviewButton('confirm', '确认并用于测算', 'llm-ai-review-primary') + reviewButton('ignore', '忽略此结果', 'llm-ai-review-secondary') + '</div></div>';
             } else if (reviewStatus === 'confirmed') {
-                parts.push('<span style="color:#3fb950;">AI结果已确认，正在用于测算</span> <button type="button" class="llm-btn llm-ai-review-action" data-ai-review-action="ignore" data-ai-review-url="' + escapeHtml(reviewUrl) + '" style="font-size:11px;padding:2px 7px;">撤销应用</button>');
+                reviewPanel = '<div class="llm-ai-review-panel llm-ai-review-confirmed"><div class="llm-ai-review-compact"><strong>✓ 已确认，AI 数据正在用于测算</strong>' + reviewButton('ignore', '撤销应用', 'llm-ai-review-secondary') + '</div></div>';
             } else if (reviewStatus === 'ignored') {
-                parts.push('<span style="color:#8b949e;">AI结果已忽略，未用于测算</span> <button type="button" class="llm-btn llm-ai-review-action" data-ai-review-action="confirm" data-ai-review-url="' + escapeHtml(reviewUrl) + '" style="font-size:11px;padding:2px 7px;border-color:#3fb950;">重新应用</button>');
+                reviewPanel = '<div class="llm-ai-review-panel llm-ai-review-ignored"><div class="llm-ai-review-compact"><span>此 AI 结果已忽略，未用于测算</span>' + reviewButton('confirm', '重新应用', 'llm-ai-review-secondary') + '</div></div>';
             }
         }
         if (aiFailed && failureText) {
@@ -2245,15 +2248,17 @@
         } else if (aiNotExecuted && stateText && diagnosticText) {
             parts.push('AI状态：' + escapeHtml(stateText));
         }
-        if (diagnosticText) {
+        const hasAiIssue = aiFailed || aiNotExecuted || /未复核/.test(effectiveStatus) || Boolean(diagnosticAdvice);
+        if (diagnosticText && hasAiIssue) {
             const copyText = 'AI诊断：' + diagnosticText
                 + (diagnosticAdvice ? '\n初步判断：' + diagnosticAdvice : '')
                 + (stateText ? '\nAI状态：' + stateText : '')
                 + (failureText ? '\nAI错误：' + failureText : '');
-            parts.push('AI诊断：' + escapeHtml(diagnosticText) + ' <button type="button" class="llm-btn llm-copy-ai-diagnostics" data-ai-diagnostics="' + escapeHtml(copyText) + '" style="font-size:11px;padding:2px 7px;">复制 AI 诊断</button>');
-            if (diagnosticAdvice) parts.push('初步判断：' + escapeHtml(diagnosticAdvice));
+            diagnosticPanel = '<div class="llm-ai-diagnostics-panel"><div class="llm-ai-diagnostics-heading">复核遇到问题，可复制诊断信息排查</div><div>AI诊断：' + escapeHtml(diagnosticText) + '</div>'
+                + (diagnosticAdvice ? '<div>初步判断：' + escapeHtml(diagnosticAdvice) + '</div>' : '')
+                + '<button type="button" class="llm-btn llm-copy-ai-diagnostics" data-ai-diagnostics="' + escapeHtml(copyText) + '">复制 AI 诊断</button></div>';
         }
-        return parts.join('；');
+        return parts.join('；') + reviewPanel + diagnosticPanel;
     }
 
     function getProbeDisplay(probe) {
@@ -2900,6 +2905,27 @@
         #llm-modal .llm-settings-label { display: block; margin-top: 8px; color: var(--llm-text-dim); font-size: 11px; }
         #llm-modal .llm-source-status { font-size: 11px; margin-top: 5px; line-height: 1.4; }
         #llm-modal .llm-muted { color: var(--llm-text-dim); font-size: 11px; line-height: 1.5; }
+        #llm-modal .llm-ai-review-panel {
+            margin: 9px 0 4px; padding: 10px 12px; border-radius: 8px;
+            color: var(--llm-text); font-size: 12px; line-height: 1.55;
+        }
+        #llm-modal .llm-ai-review-pending { background: rgba(210,153,34,.14); }
+        #llm-modal .llm-ai-review-confirmed { background: rgba(35,134,54,.14); }
+        #llm-modal .llm-ai-review-ignored { background: rgba(139,148,158,.10); }
+        #llm-modal .llm-ai-review-heading { display: block; margin-bottom: 2px; color: #f0c75e; font-size: 12px; }
+        #llm-modal .llm-ai-review-confirmed strong { color: #7ee787; }
+        #llm-modal .llm-ai-review-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+        #llm-modal .llm-ai-review-panel .llm-btn { padding: 6px 10px; font-size: 11px; }
+        #llm-modal .llm-ai-review-primary { border-color: #3fb950; background: #238636; color: #fff; font-weight: 600; }
+        #llm-modal .llm-ai-review-primary:hover { background: #2ea043; }
+        #llm-modal .llm-ai-review-secondary { background: rgba(255,255,255,.06); color: var(--llm-text); }
+        #llm-modal .llm-ai-review-compact { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+        #llm-modal .llm-ai-diagnostics-panel {
+            display: grid; gap: 5px; margin-top: 8px; padding: 9px 11px; border-radius: 8px;
+            background: rgba(248,81,73,.08); color: #ffb4ad; overflow-wrap: anywhere;
+        }
+        #llm-modal .llm-ai-diagnostics-heading { color: #ff8b82; font-weight: 600; }
+        #llm-modal .llm-ai-diagnostics-panel .llm-btn { justify-self: start; padding: 4px 8px; font-size: 11px; }
         #llm-modal .llm-calc-hero {
             display: flex; justify-content: space-between; align-items: flex-start; gap: 14px;
             background: linear-gradient(135deg, rgba(56,139,253,.18), rgba(35,134,54,.12));
