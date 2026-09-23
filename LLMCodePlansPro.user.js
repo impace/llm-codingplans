@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.15.1
+// @version      2.15.3
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.15.1';
+    const APP_VERSION = '2.15.3';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -2517,16 +2517,29 @@
         }).filter(index => index !== null);
     }
 
-    function aiSourceTableMatch(plan, sourceText, type, item, evidence = '') {
+    function aiSourceTableMatch(plan, sourceText, type, item, evidence = '', knownPlans = []) {
         const combinedSource = [String(sourceText || ''), String(evidence || '')].filter(Boolean).join('\n');
         const rows = combinedSource.split(/\n+/)
             .map(line => line.split('|').map(cell => cell.trim()))
             .filter(cells => cells.length >= 2 && cells.some(Boolean));
-        const planOrder = aiPlanOrder(combinedSource);
+        const detectedOrder = aiPlanOrder(combinedSource);
+        const knownOrder = [...new Set((Array.isArray(knownPlans) ? knownPlans : [])
+            .map(value => String(value || '').trim())
+            .filter(value => value && value !== '未标注套餐'))];
+        const planOrder = knownOrder.length >= 2 ? knownOrder : detectedOrder;
         const planIndex = planOrder.findIndex(item => planMatches(item, plan));
         const tierNames = ['free', 'go', 'lite', 'essential', 'standard', 'pro', 'plus', 'max', 'heavy', 'ultra', 'team'];
         const hasPlanHeader = cells => cells.filter(cell => tierNames.some(tier => aiEvidenceContainsPlan(tier, cell))).length >= 2;
-        const buildMatch = (rowIndex, row, column, headerIndex = -1, rowLabel = '') => ({ rowLabel, rowIndex, headerIndex, column });
+        const buildMatch = (rowIndex, row, column, headerIndex = -1, rowLabel = '') => ({
+            rowLabel,
+            rowIndex,
+            headerIndex,
+            column,
+            contextText: rows.slice(Math.max(0, rowIndex - 3), Math.min(rows.length, rowIndex + 4))
+                .flat()
+                .filter(Boolean)
+                .join(' | ')
+        });
         let fallbackMatch = null;
         for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
             const dataRow = rows[rowIndex];
@@ -2634,9 +2647,13 @@
         return [...new Set(result)];
     }
 
-    function aiResolveWindow(item, evidence, tableRowLabel = '') {
+    function aiResolveWindow(item, evidence, tableRowLabel = '', tableContext = '') {
         const declared = aiWindowKey(item?.window);
-        const quoted = aiEvidenceWindows(String(evidence || '') + ' ' + String(tableRowLabel || ''));
+        const quoted = aiEvidenceWindows([
+            String(evidence || ''),
+            String(tableRowLabel || ''),
+            String(tableContext || '')
+        ].filter(Boolean).join(' '));
         if (declared && quoted.includes(declared)) return declared;
         if (!declared && quoted.length === 1) return quoted[0];
         return '';
@@ -2695,13 +2712,13 @@
         return conflicted;
     }
 
-    function aiFieldIssue(snapshot, type, item, conflictedKeys) {
+    function aiFieldIssue(snapshot, type, item, conflictedKeys, knownPlans = []) {
         const issues = [];
         const evidence = String(item.evidence || '').trim();
         const sourceText = String(snapshot?.evidenceText || snapshot?.excerpt || '');
         const key = aiFieldKey(type, item);
         const tableMatch = item.plan && item.plan !== '未标注套餐'
-            ? aiSourceTableMatch(item.plan, sourceText, type, item, evidence)
+            ? aiSourceTableMatch(item.plan, sourceText, type, item, evidence, knownPlans)
             : null;
         if (!item.plan || item.plan === '未标注套餐') {
             issues.push('AI 未提供明确套餐名');
@@ -2733,7 +2750,7 @@
             else if (!aiEvidenceContainsValue(type, item, evidence)) {
                 issues.push('原文证据中找不到相同数量级的数值和单位');
             }
-            const resolvedWindow = aiResolveWindow(item, evidence, tableMatch?.rowLabel || '');
+            const resolvedWindow = aiResolveWindow(item, evidence, tableMatch?.rowLabel || '', tableMatch?.contextText || '');
             if (!resolvedWindow || !Number.isFinite(monthlyMultiplier(resolvedWindow))) {
                 issues.push('额度周期不明确，不能可靠折算');
             }
@@ -2753,10 +2770,13 @@
 
         const conflictedKeys = aiDataConflictKeys(sourceData);
         const process = (type, rows, destination) => {
+            const knownPlans = [...new Set((Array.isArray(rows) ? rows : [])
+                .map(item => String(item?.plan || '').trim())
+                .filter(plan => plan && plan !== '未标注套餐'))];
             (Array.isArray(rows) ? rows : []).forEach(item => {
                 const key = aiFieldKey(type, item);
                 const decision = String(fieldDecisions[key] || '');
-                const issues = aiFieldIssue(snapshot, type, item, conflictedKeys);
+                const issues = aiFieldIssue(snapshot, type, item, conflictedKeys, knownPlans);
                 const exception = { type, item, key, issues, decision };
                 if (issues.length) exceptions.push(exception);
                 if (issues.length && decision !== 'accepted') {
@@ -2769,10 +2789,10 @@
                     return;
                 }
                 const tableMatch = item.plan && item.plan !== '未标注套餐'
-                    ? aiSourceTableMatch(item.plan, snapshot?.evidenceText || snapshot?.excerpt || '', type, item, item.evidence)
+                    ? aiSourceTableMatch(item.plan, snapshot?.evidenceText || snapshot?.excerpt || '', type, item, item.evidence, knownPlans)
                     : null;
                 const resolvedWindow = type === 'quota' || type === 'estimate'
-                    ? aiResolveWindow(item, item.evidence, tableMatch?.rowLabel || '')
+                    ? aiResolveWindow(item, item.evidence, tableMatch?.rowLabel || '', tableMatch?.contextText || '')
                     : '';
                 destination.push(resolvedWindow ? { ...item, window: resolvedWindow } : item);
                 if (issues.length) counts.accepted += 1;
