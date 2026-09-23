@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.14.9
+// @version      2.15.1
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.14.9';
+    const APP_VERSION = '2.15.1';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -2484,34 +2484,111 @@
             && aiEvidenceQuantities(evidence).some(value => value.kind === kind && Math.abs(value.value - metric) <= Math.max(1e-8, Math.abs(metric) * 1e-6));
     }
 
-    function aiSourceTableMatch(plan, sourceText, type, item) {
-        const rows = String(sourceText || '').split(/\n+/)
+    function aiPlanOrder(sourceText) {
+        const tierPattern = /Free|Go|Lite|Essential|Standard|Pro\+?|Plus|Max|Heavy|Ultra|Team/gi;
+        const lines = String(sourceText || '').split(/\n+/);
+        const preferred = lines
+            .filter(line => !/检测到套餐词|确定性信号|来源 URL|页面元信息/i.test(line))
+            .sort((a, b) => Number(b.includes('|')) - Number(a.includes('|')));
+        const candidates = [...preferred, ...lines];
+        for (const line of candidates) {
+            const result = [];
+            let match;
+            const re = new RegExp(tierPattern.source, 'gi');
+            while ((match = re.exec(line))) {
+                const name = match[0];
+                if (!result.some(item => normalizePlanKey(item) === normalizePlanKey(name))) result.push(name);
+            }
+            if (result.length >= 2) return result;
+        }
+        return [];
+    }
+
+    function aiTableCandidateColumns(type, row) {
+        return row.map((cell, index) => {
+            const text = String(cell || '').trim();
+            if (!text) return null;
+            if (type === 'price') {
+                return /(?:¥|￥|元|人民币|CNY|RMB|USD|US\$|美元|€|EUR|£|GBP|日元|JPY|港币|HKD|₩|KRW|\$)/i.test(text)
+                    && aiNumbersInText(text).length ? index : null;
+            }
+            return /(?:tokens?|credits?|points?|requests?|calls?|messages?|积分|点数|次|请求|调用)/i.test(text)
+                && aiNumbersInText(text).length ? index : null;
+        }).filter(index => index !== null);
+    }
+
+    function aiSourceTableMatch(plan, sourceText, type, item, evidence = '') {
+        const combinedSource = [String(sourceText || ''), String(evidence || '')].filter(Boolean).join('\n');
+        const rows = combinedSource.split(/\n+/)
             .map(line => line.split('|').map(cell => cell.trim()))
             .filter(cells => cells.length >= 2 && cells.some(Boolean));
+        const planOrder = aiPlanOrder(combinedSource);
+        const planIndex = planOrder.findIndex(item => planMatches(item, plan));
+        const tierNames = ['free', 'go', 'lite', 'essential', 'standard', 'pro', 'plus', 'max', 'heavy', 'ultra', 'team'];
+        const hasPlanHeader = cells => cells.filter(cell => tierNames.some(tier => aiEvidenceContainsPlan(tier, cell))).length >= 2;
+        const buildMatch = (rowIndex, row, column, headerIndex = -1, rowLabel = '') => ({ rowLabel, rowIndex, headerIndex, column });
+        let fallbackMatch = null;
         for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
             const dataRow = rows[rowIndex];
             const valueColumns = dataRow.map((cell, index) => ({ cell, index }))
                 .filter(({ cell }) => aiEvidenceContainsValue(type, item, cell))
                 .map(({ index }) => index);
             if (!valueColumns.length) continue;
+            const candidateColumns = aiTableCandidateColumns(type, dataRow);
+            const allValueColumns = candidateColumns.length >= 2 ? candidateColumns : valueColumns;
+            const groupSize = planOrder.length && allValueColumns.length % planOrder.length === 0
+                ? allValueColumns.length / planOrder.length
+                : 0;
+
+            // AI 有时会把“套餐表头 + 数据行”压成同一行：Lite | Essential | ... | 11,500 | 25,500 | ...。
+            const inlinePlanColumns = dataRow.map((cell, index) => ({ cell, index }))
+                .filter(({ cell }) => tierNames.some(tier => aiEvidenceContainsPlan(tier, cell)))
+                .map(({ index }) => index);
+            if (inlinePlanColumns.length >= 2 && planIndex >= 0) {
+                const orderedValues = allValueColumns.filter(index => index > inlinePlanColumns[inlinePlanColumns.length - 1]);
+                const targetValue = orderedValues[planIndex];
+                if (targetValue !== undefined && valueColumns.includes(targetValue)) {
+                    const rowLabel = [...rows.slice(Math.max(0, rowIndex - 3), rowIndex + 1).flat(), ...dataRow.slice(0, inlinePlanColumns[0])]
+                        .filter(cell => /每月|每周|每日|额度|定价|价格|原价|限时|monthly|weekly|daily/i.test(cell)).join(' | ');
+                    const match = buildMatch(rowIndex, dataRow, targetValue, rowIndex, rowLabel);
+                    if (rowLabel) return match;
+                    fallbackMatch ||= match;
+                }
+            }
+
+            // 页面正文可能只有多列价格/额度行，套餐顺序来自页面元信息“检测到套餐词”。
+            if (planIndex >= 0 && planOrder.length === allValueColumns.length && allValueColumns[planIndex] !== undefined) {
+                const column = allValueColumns[planIndex];
+                if (!valueColumns.includes(column)) continue;
+                const rowLabel = [...rows.slice(Math.max(0, rowIndex - 3), rowIndex + 1).flat(), ...dataRow.slice(0, column)]
+                    .filter(cell => /每月|每周|每日|额度|定价|价格|原价|限时|monthly|weekly|daily/i.test(cell)).join(' | ');
+                const match = buildMatch(rowIndex, dataRow, column, -1, rowLabel);
+                if (rowLabel) return match;
+                fallbackMatch ||= match;
+            }
+            if (planIndex >= 0 && groupSize > 0) {
+                const groupStart = planIndex * groupSize;
+                const group = allValueColumns.slice(groupStart, groupStart + groupSize);
+                const column = group.find(index => valueColumns.includes(index));
+                if (column !== undefined) {
+                    const rowLabel = [...rows.slice(Math.max(0, rowIndex - 3), rowIndex + 1).flat(), ...dataRow.slice(0, column)]
+                        .filter(cell => /每月|每周|每日|额度|定价|价格|原价|限时|monthly|weekly|daily/i.test(cell)).join(' | ');
+                    const match = buildMatch(rowIndex, dataRow, column, -1, rowLabel);
+                    if (rowLabel) return match;
+                    fallbackMatch ||= match;
+                }
+            }
             for (let headerIndex = Math.max(0, rowIndex - 10); headerIndex < rowIndex; headerIndex++) {
                 const header = rows[headerIndex];
                 if (header.length !== dataRow.length) continue;
-                const tierCount = header.filter(cell => ['free', 'go', 'lite', 'essential', 'standard', 'pro', 'plus', 'max', 'heavy', 'ultra', 'team']
-                    .some(tier => aiEvidenceContainsPlan(tier, cell))).length;
-                if (tierCount < 2) continue;
+                if (!hasPlanHeader(header)) continue;
                 const column = valueColumns.find(index => aiEvidenceContainsPlan(plan, header[index]));
                 if (column !== undefined) {
-                    return {
-                        rowLabel: dataRow.slice(0, column).filter(Boolean).slice(0, 2).join(' | '),
-                        rowIndex,
-                        headerIndex,
-                        column
-                    };
+                    return buildMatch(rowIndex, dataRow, column, headerIndex, dataRow.slice(0, column).filter(Boolean).slice(0, 2).join(' | '));
                 }
             }
         }
-        return null;
+        return fallbackMatch;
     }
 
     function aiUnitScale(value) {
@@ -2624,7 +2701,7 @@
         const sourceText = String(snapshot?.evidenceText || snapshot?.excerpt || '');
         const key = aiFieldKey(type, item);
         const tableMatch = item.plan && item.plan !== '未标注套餐'
-            ? aiSourceTableMatch(item.plan, sourceText, type, item)
+            ? aiSourceTableMatch(item.plan, sourceText, type, item, evidence)
             : null;
         if (!item.plan || item.plan === '未标注套餐') {
             issues.push('AI 未提供明确套餐名');
@@ -2692,7 +2769,7 @@
                     return;
                 }
                 const tableMatch = item.plan && item.plan !== '未标注套餐'
-                    ? aiSourceTableMatch(item.plan, snapshot?.evidenceText || snapshot?.excerpt || '', type, item)
+                    ? aiSourceTableMatch(item.plan, snapshot?.evidenceText || snapshot?.excerpt || '', type, item, item.evidence)
                     : null;
                 const resolvedWindow = type === 'quota' || type === 'estimate'
                     ? aiResolveWindow(item, item.evidence, tableMatch?.rowLabel || '')
