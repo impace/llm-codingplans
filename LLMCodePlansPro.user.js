@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.14.7
+// @version      2.14.8
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.14.7';
+    const APP_VERSION = '2.14.8';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -241,6 +241,7 @@
     const MAX_PROBE_BYTES = 500000;
     const MAX_AI_EXCERPT_CHARS = 18000;
     const MAX_AI_EVIDENCE_CHARS = 18000;
+    const MAX_AI_FIELD_EVIDENCE_CHARS = 220;
     const MAX_AI_SOURCE_CHARS = 180000;
     const REQUEST_TOKEN_SCENARIOS = {
         conservative: 8000,
@@ -961,9 +962,13 @@
         // HTTP/渲染正文经常把导航、面包屑和脚注重复拼接多次；这里仅对发送给 AI 的副本去重。
         const noiseOnly = /^(首页|主页|菜单|导航|搜索|登录|注册|退出|帮助|关于我们|联系我们|隐私政策|服务条款|返回顶部|上一页|下一页|更多|展开|收起|share|sign\s*in|log\s*in|register|menu|search|home|next|previous|back|more)$/i;
         const segments = normalized
-            .replace(/([。！？；.!?;])[ \t]+/g, '$1\n')
-            .replace(/\s+(?=\b(?:Lite|Essential|Standard|Pro\+?|Plus|Max|Heavy|Ultra|Team|Go)\b)/gi, '\n')
             .split(/\n+/)
+            .flatMap(line => {
+                const sentences = line.includes('|') ? [line] : line.replace(/([。！？；.!?;])[ \t]+/g, '$1\n').split(/\n+/);
+                return sentences.flatMap(sentence => sentence
+                    .replace(/[ \t]+(?=\b(?:Lite|Essential|Standard|Pro\+?|Plus|Max|Heavy|Ultra|Team|Go)\b)/gi, (spaces, offset, whole) => whole[offset - 1] === '|' ? spaces : '\n')
+                    .split(/\n+/));
+            })
             .map(item => item.trim())
             .filter(item => item.length >= 8 && !noiseOnly.test(item));
         const seenSegments = new Set();
@@ -1086,7 +1091,7 @@
                 currency,
                 billingPeriod: String(row.billingPeriod || 'unknown').trim().slice(0, 30),
                 amountCny: Number.isFinite(amountCny) ? amountCny : null,
-                evidence: String(row.evidence || '').trim().slice(0, 100)
+                evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
         }).filter(item => item.amount !== null) : [];
         const quotas = Array.isArray(source.quotas) ? source.quotas.slice(0, 30).map(item => {
@@ -1097,7 +1102,7 @@
                 value: Number.isFinite(numericValue) ? numericValue : String(row.value || '').trim().slice(0, 80),
                 unit: String(row.unit || 'unknown').trim().slice(0, 30),
                 window: String(row.window || 'unknown').trim().slice(0, 30),
-                evidence: String(row.evidence || '').trim().slice(0, 100)
+                evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
         }) : [];
         const modelEstimates = Array.isArray(source.modelEstimates) ? source.modelEstimates.slice(0, 40).map(item => {
@@ -1111,7 +1116,7 @@
                 estimatedUnit: String(row.estimatedUnit || row.unit || 'unknown').trim().slice(0, 40),
                 window: String(row.window || 'unknown').trim().slice(0, 30),
                 basis: String(row.basis || '页面估算').trim().slice(0, 120),
-                evidence: String(row.evidence || '').trim().slice(0, 100)
+                evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
         }).filter(item => item.model && item.estimatedTokens !== '') : [];
         return {
@@ -1186,7 +1191,7 @@
             'Credits、积分、请求数和消息数不能猜测为 Token；分别使用 credits、points、requests、messages 等单位。',
             '如果页面提供“模型 × 套餐档位”的 Token 用量预估，必须单独放入 modelEstimates；这是按模型估算，不是固定套餐 Token，不要把不同模型相加。',
             'prices 最多返回 20 条，quotas 最多返回 30 条，modelEstimates 最多返回 40 条，models 最多返回 30 条，warnings 最多返回 10 条。',
-            '每条 evidence 最多 100 字；必须逐字复制证据包中的原文片段，并尽量同时包含套餐名、数值、单位和周期；不得改写或拼接不同位置的文字。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
+            '每条 evidence 最多 220 字，必须逐字复制证据包中的原文，不得改写或自行补字。优先引用能包含数值、单位/币种和行标签的最短原文片段。若套餐名是表格列标题，不要把其他套餐的值拼进证据；准确填写 plan，并让 evidence 保留该数据行的原始单元格分隔符（如 |），脚本会根据抓取正文的表头和列位置核对套餐对应关系。只有原文没有可识别表格列关系时，才引用同时包含套餐名和目标数值的连续片段。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
             '没有同时看到明确模型、套餐和 Token 数值时，不要生成 modelEstimates；请求次数、Credits、积分不能转成 Token。',
             '必须输出紧凑且完整的 JSON，确保最后一个字段和所有括号闭合。',
             '必须只返回 JSON，不要 Markdown 代码围栏。JSON 字段：',
@@ -1195,9 +1200,9 @@
                 needsReview: true,
                 changeSummary: '本次页面变化的简短说明',
                 pageCurrency: 'USD|EUR|GBP|JPY|CNY|HKD|KRW|UNKNOWN',
-                prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', evidence: '原文短证据' }],
-                quotas: [{ plan: '套餐名', value: 0, unit: 'tokens|K tokens|M tokens|B tokens|requests|messages|credits|points|unknown', window: '5h|daily|weekly|monthly|unknown', evidence: '原文短证据' }],
-                modelEstimates: [{ plan: '套餐档位', model: '模型名称', modelId: 'Model ID', estimatedTokens: 0, estimatedUnit: 'tokens|K tokens|万 tokens|M tokens|B tokens', window: 'monthly|weekly|daily|5h|unknown', basis: '官方页面估算/官方规则推算', evidence: '逐字复制的原文短证据' }],
+                prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', evidence: '逐字复制的原文证据，保留对应表格行/列上下文' }],
+                quotas: [{ plan: '套餐名', value: 0, unit: 'tokens|K tokens|M tokens|B tokens|requests|messages|credits|points|unknown', window: '5h|daily|weekly|monthly|unknown', evidence: '逐字复制的原文证据，保留对应表格行/列上下文' }],
+                modelEstimates: [{ plan: '套餐档位', model: '模型名称', modelId: 'Model ID', estimatedTokens: 0, estimatedUnit: 'tokens|K tokens|万 tokens|M tokens|B tokens', window: 'monthly|weekly|daily|5h|unknown', basis: '官方页面估算/官方规则推算', evidence: '逐字复制的原文证据，保留对应表格行/列上下文' }],
                 models: ['正文明确提及的模型'],
                 warnings: ['币种、地区、登录态或页面不确定性']
             }),
@@ -1707,14 +1712,56 @@
         return sanitizeProbeText(pieces.join('\n')).slice(0, MAX_PROBE_BYTES);
     }
 
+    function extractRenderedNodeText(node) {
+        if (!node) return '';
+        let hasTable = false;
+        try { hasTable = Boolean(node.matches?.('table, [role="table"], [role="grid"]') || node.querySelector('table, [role="table"], [role="grid"]')); } catch {}
+        if (!hasTable) return String(node.innerText || node.textContent || '').trim();
+        let clone;
+        try { clone = node.cloneNode(true); } catch { return String(node.innerText || node.textContent || '').trim(); }
+        const tables = [];
+        if (clone.matches?.('table, [role="table"], [role="grid"]')) tables.push(clone);
+        try { tables.push(...clone.querySelectorAll('table, [role="table"], [role="grid"]')); } catch {}
+        let rootTableText = '';
+        const depth = element => {
+            let value = 0;
+            for (let parent = element.parentElement; parent; parent = parent.parentElement) value++;
+            return value;
+        };
+        tables.sort((a, b) => depth(b) - depth(a)).forEach(table => {
+            let rows = [];
+            if (table.matches('table')) {
+                rows = Array.from(table.rows || []).map(row => Array.from(row.cells || []).map(cell => String(cell.innerText || cell.textContent || '').replace(/\s+/g, ' ').trim()));
+            } else {
+                rows = Array.from(table.querySelectorAll('[role="row"]'))
+                    .filter(row => row.closest('[role="table"], [role="grid"]') === table)
+                    .map(row => Array.from(row.querySelectorAll('[role="columnheader"], [role="rowheader"], [role="cell"], [role="gridcell"]'))
+                        .filter(cell => cell.closest('[role="row"]') === row)
+                        .map(cell => String(cell.innerText || cell.textContent || '').replace(/\s+/g, ' ').trim()));
+            }
+            const tableText = rows.filter(row => row.some(cell => cell)).map(row => row.join(' | ')).join('\n');
+            if (!tableText) return;
+            if (table === clone) {
+                rootTableText = '[表格]\n' + tableText + '\n[/表格]';
+                return;
+            }
+            try {
+                const pre = (table.ownerDocument || document).createElement('pre');
+                pre.textContent = '[表格]\n' + tableText + '\n[/表格]';
+                table.replaceWith(pre);
+            } catch {}
+        });
+        return rootTableText || String(clone.innerText || clone.textContent || '').trim();
+    }
+
     function extractRenderedText(rule) {
         const selectors = rule.selectors?.length ? rule.selectors : ['main', 'article', '[role="main"]', 'body'];
         const candidates = [];
         selectors.forEach(sel => {
             try {
                 document.querySelectorAll(sel).forEach(node => {
-                    const t = String(node.innerText || node.textContent || '').trim();
-                    if (t) candidates.push(t);
+                    const text = String(node.innerText || node.textContent || '').trim();
+                    if (text) candidates.push({ node, text });
                 });
             } catch {}
         });
@@ -1724,13 +1771,14 @@
                     const frameDoc = frame.contentDocument;
                     if (!frameDoc) return;
                     const frameText = String(frameDoc.body?.innerText || frameDoc.body?.textContent || '').trim();
-                    if (frameText) candidates.push(frameText);
+                    if (frameText) candidates.push({ node: frameDoc.body, text: frameText });
                 } catch {}
             });
         } catch {}
-        const longest = candidates.sort((a, b) => b.length - a.length)[0] || '';
+        const longest = candidates.sort((a, b) => b.text.length - a.text.length)[0];
+        const rendered = longest ? extractRenderedNodeText(longest.node) : '';
         const embedded = extractEmbeddedRenderedText();
-        return normalizeAiSourceText([longest, embedded].filter(Boolean).join('\n')).slice(0, MAX_PROBE_BYTES);
+        return normalizeAiSourceText([rendered, embedded].filter(Boolean).join('\n')).slice(0, MAX_PROBE_BYTES);
     }
 
     function captureRenderedSourceIfRequested() {
@@ -2414,9 +2462,51 @@
         const evidenceKey = normalizePlanKey(evidence);
         const tierNames = ['free', 'go', 'lite', 'essential', 'standard', 'pro', 'plus', 'max', 'heavy', 'ultra', 'team'];
         const planTiers = planKey.split(/\s+/).filter(word => tierNames.includes(word));
-        if (planTiers.length) return planTiers.some(word => evidenceKey.split(/\s+/).includes(word));
+        if (planTiers.length) {
+            const evidenceWords = evidenceKey.split(/\s+/);
+            return evidenceWords.some((_, index) => planTiers.every((word, tierIndex) => evidenceWords[index + tierIndex] === word));
+        }
         const compactPlan = normalizeAiEvidenceText(plan);
         return compactPlan.length >= 2 && normalizeAiEvidenceText(evidence).includes(compactPlan);
+    }
+
+    function aiEvidenceContainsValue(type, item, evidence) {
+        if (type === 'price') {
+            const amount = Number(item.amount);
+            return Number.isFinite(amount) && aiNumbersInText(evidence).some(value => Math.abs(value - amount) <= Math.max(1e-8, Math.abs(amount) * 1e-8));
+        }
+        const parsed = type === 'quota'
+            ? parseQuotaValue(item.value, item.unit)
+            : parseQuotaValue(item.estimatedTokens, item.estimatedUnit);
+        const metric = Number.isFinite(parsed.value) ? parsed.value * aiUnitScale(parsed.unit) : NaN;
+        const kind = aiBaseUnitKind(parsed.unit);
+        return Number.isFinite(metric) && kind !== 'unknown'
+            && aiEvidenceQuantities(evidence).some(value => value.kind === kind && Math.abs(value.value - metric) <= Math.max(1e-8, Math.abs(metric) * 1e-6));
+    }
+
+    function aiSourceTableSupportsPlan(plan, evidence, sourceText, type, item) {
+        const quote = normalizeAiEvidenceText(evidence);
+        if (!quote || !aiEvidenceContainsValue(type, item, evidence)) return false;
+        const rows = String(sourceText || '').split(/\n+/)
+            .map(line => line.split('|').map(cell => cell.trim()))
+            .filter(cells => cells.length >= 2 && cells.some(Boolean));
+        for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+            const dataRow = rows[rowIndex];
+            const rowQuoteMatches = normalizeAiEvidenceText(dataRow.join(' | ')).includes(quote);
+            const valueColumns = dataRow.map((cell, index) => ({ cell, index }))
+                .filter(({ cell }) => (rowQuoteMatches || normalizeAiEvidenceText(cell).includes(quote)) && aiEvidenceContainsValue(type, item, cell))
+                .map(({ index }) => index);
+            if (!valueColumns.length) continue;
+            for (let headerIndex = Math.max(0, rowIndex - 4); headerIndex < rowIndex; headerIndex++) {
+                const header = rows[headerIndex];
+                if (header.length !== dataRow.length) continue;
+                const tierCount = header.filter(cell => ['free', 'go', 'lite', 'essential', 'standard', 'pro', 'plus', 'max', 'heavy', 'ultra', 'team']
+                    .some(tier => aiEvidenceContainsPlan(tier, cell))).length;
+                if (tierCount < 2) continue;
+                if (valueColumns.some(column => aiEvidenceContainsPlan(plan, header[column]))) return true;
+            }
+        }
+        return false;
     }
 
     function aiUnitScale(value) {
@@ -2528,8 +2618,10 @@
         const evidence = String(item.evidence || '').trim();
         const sourceText = String(snapshot?.evidenceText || snapshot?.excerpt || '');
         const key = aiFieldKey(type, item);
-        if (!item.plan || item.plan === '未标注套餐' || !aiEvidenceContainsPlan(item.plan, evidence)) {
-            issues.push('原文证据无法对应到这个套餐');
+        if (!item.plan || item.plan === '未标注套餐') {
+            issues.push('AI 未提供明确套餐名');
+        } else if (evidence && !aiEvidenceContainsPlan(item.plan, evidence) && !aiSourceTableSupportsPlan(item.plan, evidence, sourceText, type, item)) {
+            issues.push('引用片段未写套餐名，且抓取正文中无法确认对应表格列');
         }
         if (!evidence) {
             issues.push('AI 没有提供原文证据');
@@ -2540,7 +2632,7 @@
         }
         if (type === 'price') {
             const amount = Number(item.amount);
-            if (!Number.isFinite(amount) || amount < 0 || !aiNumbersInText(evidence).some(value => Math.abs(value - amount) <= Math.max(1e-8, Math.abs(amount) * 1e-8))) {
+            if (!Number.isFinite(amount) || amount < 0 || !aiEvidenceContainsValue(type, item, evidence)) {
                 issues.push('原文证据中找不到对应价格数值');
             }
             if (!aiPriceCurrencyIsExplicit(item.currency, evidence)) issues.push('原文证据没有明确支持所标币种');
@@ -2553,7 +2645,7 @@
             const metric = Number.isFinite(parsed.value) ? parsed.value * aiUnitScale(unit) : NaN;
             if (!Number.isFinite(metric) || metric <= 0) issues.push('额度数值或单位无法安全解析');
             else if (kind === 'unknown') issues.push('额度单位不明确，无法分类');
-            else if (!aiEvidenceQuantities(evidence).some(value => value.kind === kind && Math.abs(value.value - metric) <= Math.max(1e-8, Math.abs(metric) * 1e-6))) {
+            else if (!aiEvidenceContainsValue(type, item, evidence)) {
                 issues.push('原文证据中找不到相同数量级的数值和单位');
             }
             const resolvedWindow = aiResolveWindow(item, evidence);
