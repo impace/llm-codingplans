@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.14.8
+// @version      2.14.9
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.14.8';
+    const APP_VERSION = '2.14.9';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -1191,7 +1191,7 @@
             'Credits、积分、请求数和消息数不能猜测为 Token；分别使用 credits、points、requests、messages 等单位。',
             '如果页面提供“模型 × 套餐档位”的 Token 用量预估，必须单独放入 modelEstimates；这是按模型估算，不是固定套餐 Token，不要把不同模型相加。',
             'prices 最多返回 20 条，quotas 最多返回 30 条，modelEstimates 最多返回 40 条，models 最多返回 30 条，warnings 最多返回 10 条。',
-            '每条 evidence 最多 220 字，必须逐字复制证据包中的原文，不得改写或自行补字。优先引用能包含数值、单位/币种和行标签的最短原文片段。若套餐名是表格列标题，不要把其他套餐的值拼进证据；准确填写 plan，并让 evidence 保留该数据行的原始单元格分隔符（如 |），脚本会根据抓取正文的表头和列位置核对套餐对应关系。只有原文没有可识别表格列关系时，才引用同时包含套餐名和目标数值的连续片段。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
+            '每条 evidence 最多 220 字，必须是证据包中的连续原文；禁止把分开的表头行和数据行拼接，禁止自行插入 | 或补写任何字。表格数据请引用目标数值所在的完整原始数据行（包括行标签和原有单元格分隔符），套餐名单独填写在 plan 字段，脚本会按抓取到的表头和列位置核对归属。价格/额度的数值、单位/币种和周期应能在该行或相邻行的原文中找到；若无法明确对应套餐列，不要猜测，写入 warnings。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
             '没有同时看到明确模型、套餐和 Token 数值时，不要生成 modelEstimates；请求次数、Credits、积分不能转成 Token。',
             '必须输出紧凑且完整的 JSON，确保最后一个字段和所有括号闭合。',
             '必须只返回 JSON，不要 Markdown 代码围栏。JSON 字段：',
@@ -1200,9 +1200,9 @@
                 needsReview: true,
                 changeSummary: '本次页面变化的简短说明',
                 pageCurrency: 'USD|EUR|GBP|JPY|CNY|HKD|KRW|UNKNOWN',
-                prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', evidence: '逐字复制的原文证据，保留对应表格行/列上下文' }],
-                quotas: [{ plan: '套餐名', value: 0, unit: 'tokens|K tokens|M tokens|B tokens|requests|messages|credits|points|unknown', window: '5h|daily|weekly|monthly|unknown', evidence: '逐字复制的原文证据，保留对应表格行/列上下文' }],
-                modelEstimates: [{ plan: '套餐档位', model: '模型名称', modelId: 'Model ID', estimatedTokens: 0, estimatedUnit: 'tokens|K tokens|万 tokens|M tokens|B tokens', window: 'monthly|weekly|daily|5h|unknown', basis: '官方页面估算/官方规则推算', evidence: '逐字复制的原文证据，保留对应表格行/列上下文' }],
+                prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', evidence: '逐字复制的原始价格行' }],
+                quotas: [{ plan: '套餐名', value: 0, unit: 'tokens|K tokens|M tokens|B tokens|requests|messages|credits|points|unknown', window: '5h|daily|weekly|monthly|unknown', evidence: '逐字复制的原始额度行' }],
+                modelEstimates: [{ plan: '套餐档位', model: '模型名称', modelId: 'Model ID', estimatedTokens: 0, estimatedUnit: 'tokens|K tokens|万 tokens|M tokens|B tokens', window: 'monthly|weekly|daily|5h|unknown', basis: '官方页面估算/官方规则推算', evidence: '逐字复制的原始数据行' }],
                 models: ['正文明确提及的模型'],
                 warnings: ['币种、地区、登录态或页面不确定性']
             }),
@@ -2484,29 +2484,34 @@
             && aiEvidenceQuantities(evidence).some(value => value.kind === kind && Math.abs(value.value - metric) <= Math.max(1e-8, Math.abs(metric) * 1e-6));
     }
 
-    function aiSourceTableSupportsPlan(plan, evidence, sourceText, type, item) {
-        const quote = normalizeAiEvidenceText(evidence);
-        if (!quote || !aiEvidenceContainsValue(type, item, evidence)) return false;
+    function aiSourceTableMatch(plan, sourceText, type, item) {
         const rows = String(sourceText || '').split(/\n+/)
             .map(line => line.split('|').map(cell => cell.trim()))
             .filter(cells => cells.length >= 2 && cells.some(Boolean));
         for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
             const dataRow = rows[rowIndex];
-            const rowQuoteMatches = normalizeAiEvidenceText(dataRow.join(' | ')).includes(quote);
             const valueColumns = dataRow.map((cell, index) => ({ cell, index }))
-                .filter(({ cell }) => (rowQuoteMatches || normalizeAiEvidenceText(cell).includes(quote)) && aiEvidenceContainsValue(type, item, cell))
+                .filter(({ cell }) => aiEvidenceContainsValue(type, item, cell))
                 .map(({ index }) => index);
             if (!valueColumns.length) continue;
-            for (let headerIndex = Math.max(0, rowIndex - 4); headerIndex < rowIndex; headerIndex++) {
+            for (let headerIndex = Math.max(0, rowIndex - 10); headerIndex < rowIndex; headerIndex++) {
                 const header = rows[headerIndex];
                 if (header.length !== dataRow.length) continue;
                 const tierCount = header.filter(cell => ['free', 'go', 'lite', 'essential', 'standard', 'pro', 'plus', 'max', 'heavy', 'ultra', 'team']
                     .some(tier => aiEvidenceContainsPlan(tier, cell))).length;
                 if (tierCount < 2) continue;
-                if (valueColumns.some(column => aiEvidenceContainsPlan(plan, header[column]))) return true;
+                const column = valueColumns.find(index => aiEvidenceContainsPlan(plan, header[index]));
+                if (column !== undefined) {
+                    return {
+                        rowLabel: dataRow.slice(0, column).filter(Boolean).slice(0, 2).join(' | '),
+                        rowIndex,
+                        headerIndex,
+                        column
+                    };
+                }
             }
         }
-        return false;
+        return null;
     }
 
     function aiUnitScale(value) {
@@ -2552,9 +2557,9 @@
         return [...new Set(result)];
     }
 
-    function aiResolveWindow(item, evidence) {
+    function aiResolveWindow(item, evidence, tableRowLabel = '') {
         const declared = aiWindowKey(item?.window);
-        const quoted = aiEvidenceWindows(evidence);
+        const quoted = aiEvidenceWindows(String(evidence || '') + ' ' + String(tableRowLabel || ''));
         if (declared && quoted.includes(declared)) return declared;
         if (!declared && quoted.length === 1) return quoted[0];
         return '';
@@ -2618,9 +2623,12 @@
         const evidence = String(item.evidence || '').trim();
         const sourceText = String(snapshot?.evidenceText || snapshot?.excerpt || '');
         const key = aiFieldKey(type, item);
+        const tableMatch = item.plan && item.plan !== '未标注套餐'
+            ? aiSourceTableMatch(item.plan, sourceText, type, item)
+            : null;
         if (!item.plan || item.plan === '未标注套餐') {
             issues.push('AI 未提供明确套餐名');
-        } else if (evidence && !aiEvidenceContainsPlan(item.plan, evidence) && !aiSourceTableSupportsPlan(item.plan, evidence, sourceText, type, item)) {
+        } else if (evidence && !aiEvidenceContainsPlan(item.plan, evidence) && !tableMatch) {
             issues.push('引用片段未写套餐名，且抓取正文中无法确认对应表格列');
         }
         if (!evidence) {
@@ -2628,7 +2636,7 @@
         } else {
             const quote = normalizeAiEvidenceText(evidence);
             const source = normalizeAiEvidenceText(sourceText);
-            if (quote.length < 6 || !source.includes(quote)) issues.push('引用内容无法在本次抓取正文中核实');
+            if ((quote.length < 6 || !source.includes(quote)) && !tableMatch) issues.push('引用不是网页中的连续原文，且无法通过表格行列核实');
         }
         if (type === 'price') {
             const amount = Number(item.amount);
@@ -2648,7 +2656,7 @@
             else if (!aiEvidenceContainsValue(type, item, evidence)) {
                 issues.push('原文证据中找不到相同数量级的数值和单位');
             }
-            const resolvedWindow = aiResolveWindow(item, evidence);
+            const resolvedWindow = aiResolveWindow(item, evidence, tableMatch?.rowLabel || '');
             if (!resolvedWindow || !Number.isFinite(monthlyMultiplier(resolvedWindow))) {
                 issues.push('额度周期不明确，不能可靠折算');
             }
@@ -2683,7 +2691,12 @@
                     counts.ignored += 1;
                     return;
                 }
-                const resolvedWindow = type === 'quota' || type === 'estimate' ? aiResolveWindow(item, item.evidence) : '';
+                const tableMatch = item.plan && item.plan !== '未标注套餐'
+                    ? aiSourceTableMatch(item.plan, snapshot?.evidenceText || snapshot?.excerpt || '', type, item)
+                    : null;
+                const resolvedWindow = type === 'quota' || type === 'estimate'
+                    ? aiResolveWindow(item, item.evidence, tableMatch?.rowLabel || '')
+                    : '';
                 destination.push(resolvedWindow ? { ...item, window: resolvedWindow } : item);
                 if (issues.length) counts.accepted += 1;
                 else counts.automatic += 1;
