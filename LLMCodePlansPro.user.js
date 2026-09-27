@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.15.4
+// @version      2.15.5
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.15.4';
+    const APP_VERSION = '2.15.5';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -243,6 +243,7 @@
     const MAX_AI_EVIDENCE_CHARS = 18000;
     const MAX_AI_FIELD_EVIDENCE_CHARS = 220;
     const MAX_AI_SOURCE_CHARS = 180000;
+    const AI_REVIEW_POLICY_VERSION = 2;
     const REQUEST_TOKEN_SCENARIOS = {
         conservative: 8000,
         baseline: 32000,
@@ -783,7 +784,7 @@
 
     function getReusableAiData(url, fingerprint = '') {
         const snapshot = GM_getValue(aiSnapshotKey(url), null);
-        if (!snapshot?.data || Number(snapshot.reviewPolicyVersion) !== 1) return null;
+        if (!snapshot?.data || Number(snapshot.reviewPolicyVersion) !== AI_REVIEW_POLICY_VERSION) return null;
         if (!fingerprint || String(snapshot.fingerprint || '') !== String(fingerprint)) return null;
         return snapshot.data;
     }
@@ -1075,6 +1076,39 @@
         return null;
     }
 
+    function technicalLimitText(item) {
+        const row = item && typeof item === 'object' ? item : {};
+        return [row.plan, row.model, row.modelId, row.unit, row.estimatedUnit, row.window, row.basis, row.evidence]
+            .map(value => String(value || ''))
+            .join(' ')
+            .normalize('NFKC');
+    }
+
+    function isTechnicalLimitRecord(type, item) {
+        const text = technicalLimitText(item);
+        if (!text) return false;
+        if (/(?:并发限制|并发上限|并行限制|速率限制|速率上限|请求限制|调用限制|上下文长度|上下文窗口|输入长度|输出长度|最大输入|最大输出|单次输入|单次输出|单次请求|单次调用)/i.test(text)) return true;
+        if (/(?:并发|并行|速率限制|速率上限|限流|每分钟|每秒|每小时|请求速率|调用速率|concurrenc|rate\s*limit|rate\s*cap|requests?\s*[/每](?:second|minute|hour|s|m|h)|rpm|tpm|qps|qpm|throughput)/i.test(text)) return true;
+        if (/(?:上下文(?:窗口|长度)?|context\s*(?:window|length)|最大?\s*(?:输入|输出)?\s*(?:长度|tokens?)|max(?:imum)?\s*(?:input|output)?\s*(?:length|tokens?)|单次(?:请求|调用|输入|输出)|per\s*request|one\s*(?:request|call)|output\s*length|input\s*length)/i.test(text)) return true;
+        return type === 'estimate' && /(?:unknown|未知)/i.test(String(item?.window || ''))
+            && /(?:长度|上限|limit|maximum|max\b)/i.test(text);
+    }
+
+    function normalizeTechnicalLimit(type, item) {
+        const row = item && typeof item === 'object' ? item : {};
+        return {
+            type,
+            plan: String(row.plan || '未标注套餐').trim().slice(0, 120),
+            model: String(row.model || row.modelName || '').trim().slice(0, 160),
+            modelId: String(row.modelId || '').trim().slice(0, 160),
+            value: row.value ?? row.estimatedTokens ?? '',
+            unit: String(row.unit || row.estimatedUnit || 'unknown').trim().slice(0, 40),
+            window: String(row.window || 'unknown').trim().slice(0, 30),
+            basis: String(row.basis || '').trim().slice(0, 120),
+            evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
+        };
+    }
+
     function normalizeAiExtraction(value, rates) {
         const source = value && typeof value === 'object' ? value : {};
         const confidence = ['high', 'medium', 'low'].includes(String(source.confidence).toLowerCase())
@@ -1094,6 +1128,7 @@
                 evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
         }).filter(item => item.amount !== null) : [];
+        const technicalLimits = [];
         const quotas = Array.isArray(source.quotas) ? source.quotas.slice(0, 30).map(item => {
             const row = item && typeof item === 'object' ? item : {};
             const numericValue = Number(row.value);
@@ -1104,6 +1139,10 @@
                 window: String(row.window || 'unknown').trim().slice(0, 30),
                 evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
+        }).filter(item => {
+            if (!isTechnicalLimitRecord('quota', item)) return true;
+            technicalLimits.push(normalizeTechnicalLimit('quota', item));
+            return false;
         }) : [];
         const modelEstimates = Array.isArray(source.modelEstimates) ? source.modelEstimates.slice(0, 40).map(item => {
             const row = item && typeof item === 'object' ? item : {};
@@ -1118,7 +1157,13 @@
                 basis: String(row.basis || '页面估算').trim().slice(0, 120),
                 evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
-        }).filter(item => item.model && item.estimatedTokens !== '') : [];
+        }).filter(item => item.model && item.estimatedTokens !== '').filter(item => {
+            if (!isTechnicalLimitRecord('estimate', item)) return true;
+            technicalLimits.push(normalizeTechnicalLimit('estimate', item));
+            return false;
+        }) : [];
+        const warnings = Array.isArray(source.warnings) ? source.warnings.map(v => String(v).trim()).filter(Boolean).slice(0, 10) : [];
+        if (technicalLimits.length) warnings.push('检测到 ' + technicalLimits.length + ' 项模型技术限制（并发、上下文或单次输入输出上限），已排除出额度与 Token 测算');
         return {
             confidence,
             needsReview: source.needsReview !== false,
@@ -1128,7 +1173,8 @@
             quotas,
             modelEstimates,
             models: Array.isArray(source.models) ? source.models.map(v => String(v).trim()).filter(Boolean).slice(0, 30) : [],
-            warnings: Array.isArray(source.warnings) ? source.warnings.map(v => String(v).trim()).filter(Boolean).slice(0, 10) : []
+            technicalLimits: technicalLimits.slice(0, 30),
+            warnings: warnings.slice(0, 10)
         };
     }
 
@@ -1190,6 +1236,7 @@
             'window 必须保留原始周期并尽量标准化为 monthly、weekly、daily、5h 等；同一套餐有月度和滚动窗口双重限制时，两项都要返回。',
             'Credits、积分、请求数和消息数不能猜测为 Token；分别使用 credits、points、requests、messages 等单位。',
             '如果页面提供“模型 × 套餐档位”的 Token 用量预估，必须单独放入 modelEstimates；这是按模型估算，不是固定套餐 Token，不要把不同模型相加。',
+            '并发限制、并行数、QPS/RPM/TPM、每秒/每分钟/每小时速率、上下文长度/窗口、最大输入长度、最大输出长度、单次请求限制、单次调用限制都属于模型技术参数，不是套餐额度，也不是月度 Token 容量；不要放入 quotas 或 modelEstimates，放入 warnings 即可。',
             'prices 最多返回 20 条，quotas 最多返回 30 条，modelEstimates 最多返回 40 条，models 最多返回 30 条，warnings 最多返回 10 条。',
             '每条 evidence 最多 220 字，必须是证据包中的连续原文；不要把分开的表头行和数据行拼接，也不要自行插入 | 或补写文字。evidence 可以只引用目标套餐的原始数值片段，例如“原价 60 元/月 限时 39 元/月”或“45,000 Credits”；套餐名必须单独填写在 plan 字段。只要 plan、数值、单位/币种和周期能由证据及其相邻正文确认，就可以返回该记录；不要求 evidence 重复套餐名，也不要求把整张表复制进每条 evidence。无法确认套餐归属、周期或数值时，写入 warnings。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
             '没有同时看到明确模型、套餐和 Token 数值时，不要生成 modelEstimates；请求次数、Credits、积分不能转成 Token。',
@@ -1358,7 +1405,7 @@
             saveAiSnapshot(url, {
                 fingerprint: result.fingerprint || '',
                 status: '自动筛选',
-                reviewPolicyVersion: 1,
+                reviewPolicyVersion: AI_REVIEW_POLICY_VERSION,
                 fieldDecisions: {},
                 checkedAt: aiResult.checkedAt,
                 model: aiResult.model,
@@ -2787,7 +2834,7 @@
         const fieldDecisions = snapshot?.fieldDecisions && typeof snapshot.fieldDecisions === 'object' ? snapshot.fieldDecisions : {};
         const counts = { automatic: 0, accepted: 0, ignored: 0, pending: 0 };
         if (!snapshot?.data) return { data, exceptions, counts, unsupported: false };
-        if (Number(snapshot.reviewPolicyVersion) !== 1) return { data, exceptions, counts, unsupported: true };
+        if (Number(snapshot.reviewPolicyVersion) !== AI_REVIEW_POLICY_VERSION) return { data, exceptions, counts, unsupported: true };
 
         const conflictedKeys = aiDataConflictKeys(sourceData);
         const process = (type, rows, destination) => {
@@ -2830,7 +2877,7 @@
         const snapshot = GM_getValue(aiSnapshotKey(url), null);
         if (!snapshot?.data) return false;
         if (String(snapshot.fingerprint || '') !== String(fingerprint || '')) return false;
-        if (Number(snapshot.reviewPolicyVersion) !== 1) return false;
+        if (Number(snapshot.reviewPolicyVersion) !== AI_REVIEW_POLICY_VERSION) return false;
         const exception = getAiSnapshotReview(snapshot).exceptions.find(item => item.key === fieldKey);
         if (!exception) return false;
         const fieldDecisions = { ...(snapshot.fieldDecisions || {}) };
