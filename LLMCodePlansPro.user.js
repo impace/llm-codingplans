@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.15.3
+// @version      2.15.4
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.15.3';
+    const APP_VERSION = '2.15.4';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -1191,7 +1191,7 @@
             'Credits、积分、请求数和消息数不能猜测为 Token；分别使用 credits、points、requests、messages 等单位。',
             '如果页面提供“模型 × 套餐档位”的 Token 用量预估，必须单独放入 modelEstimates；这是按模型估算，不是固定套餐 Token，不要把不同模型相加。',
             'prices 最多返回 20 条，quotas 最多返回 30 条，modelEstimates 最多返回 40 条，models 最多返回 30 条，warnings 最多返回 10 条。',
-            '每条 evidence 最多 220 字，必须是证据包中的连续原文；禁止把分开的表头行和数据行拼接，禁止自行插入 | 或补写任何字。表格数据请引用目标数值所在的完整原始数据行（包括行标签和原有单元格分隔符），套餐名单独填写在 plan 字段，脚本会按抓取到的表头和列位置核对归属。价格/额度的数值、单位/币种和周期应能在该行或相邻行的原文中找到；若无法明确对应套餐列，不要猜测，写入 warnings。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
+            '每条 evidence 最多 220 字，必须是证据包中的连续原文；不要把分开的表头行和数据行拼接，也不要自行插入 | 或补写文字。evidence 可以只引用目标套餐的原始数值片段，例如“原价 60 元/月 限时 39 元/月”或“45,000 Credits”；套餐名必须单独填写在 plan 字段。只要 plan、数值、单位/币种和周期能由证据及其相邻正文确认，就可以返回该记录；不要求 evidence 重复套餐名，也不要求把整张表复制进每条 evidence。无法确认套餐归属、周期或数值时，写入 warnings。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
             '没有同时看到明确模型、套餐和 Token 数值时，不要生成 modelEstimates；请求次数、Credits、积分不能转成 Token。',
             '必须输出紧凑且完整的 JSON，确保最后一个字段和所有括号闭合。',
             '必须只返回 JSON，不要 Markdown 代码围栏。JSON 字段：',
@@ -2484,6 +2484,23 @@
             && aiEvidenceQuantities(evidence).some(value => value.kind === kind && Math.abs(value.value - metric) <= Math.max(1e-8, Math.abs(metric) * 1e-6));
     }
 
+    function aiEvidenceSourceContext(sourceText, evidence) {
+        const source = String(sourceText || '');
+        const quote = normalizeAiEvidenceText(evidence);
+        if (!source || !quote) return '';
+        const lines = source.split(/\n+/);
+        const lineIndex = lines.findIndex(line => normalizeAiEvidenceText(line).includes(quote));
+        if (lineIndex >= 0) {
+            return lines.slice(Math.max(0, lineIndex - 3), Math.min(lines.length, lineIndex + 4)).join(' | ');
+        }
+        const quantities = aiNumbersInText(evidence);
+        const unitPattern = /tokens?|credits?|points?|requests?|calls?|messages?|积分|点数|次|请求|调用/i;
+        const fallbackIndex = lines.findIndex(line => quantities.some(value => line.includes(String(value).replace(/,/g, ''))) && unitPattern.test(line));
+        return fallbackIndex >= 0
+            ? lines.slice(Math.max(0, fallbackIndex - 3), Math.min(lines.length, fallbackIndex + 4)).join(' | ')
+            : '';
+    }
+
     function aiPlanOrder(sourceText) {
         const tierPattern = /Free|Go|Lite|Essential|Standard|Pro\+?|Plus|Max|Heavy|Ultra|Team/gi;
         const lines = String(sourceText || '').split(/\n+/);
@@ -2647,12 +2664,13 @@
         return [...new Set(result)];
     }
 
-    function aiResolveWindow(item, evidence, tableRowLabel = '', tableContext = '') {
+    function aiResolveWindow(item, evidence, tableRowLabel = '', tableContext = '', sourceContext = '') {
         const declared = aiWindowKey(item?.window);
         const quoted = aiEvidenceWindows([
             String(evidence || ''),
             String(tableRowLabel || ''),
-            String(tableContext || '')
+            String(tableContext || ''),
+            String(sourceContext || '')
         ].filter(Boolean).join(' '));
         if (declared && quoted.includes(declared)) return declared;
         if (!declared && quoted.length === 1) return quoted[0];
@@ -2720,10 +2738,13 @@
         const tableMatch = item.plan && item.plan !== '未标注套餐'
             ? aiSourceTableMatch(item.plan, sourceText, type, item, evidence, knownPlans)
             : null;
+        const sourceContext = aiEvidenceSourceContext(sourceText, evidence);
         if (!item.plan || item.plan === '未标注套餐') {
             issues.push('AI 未提供明确套餐名');
-        } else if (evidence && !aiEvidenceContainsPlan(item.plan, evidence) && !tableMatch) {
-            issues.push('引用片段未写套餐名，且抓取正文中无法确认对应表格列');
+        } else if (evidence && !aiEvidenceContainsPlan(item.plan, evidence)
+            && !aiEvidenceContainsPlan(item.plan, sourceText)
+            && !tableMatch) {
+            issues.push('AI 提供的套餐名无法在抓取正文中确认');
         }
         if (!evidence) {
             issues.push('AI 没有提供原文证据');
@@ -2750,7 +2771,7 @@
             else if (!aiEvidenceContainsValue(type, item, evidence)) {
                 issues.push('原文证据中找不到相同数量级的数值和单位');
             }
-            const resolvedWindow = aiResolveWindow(item, evidence, tableMatch?.rowLabel || '', tableMatch?.contextText || '');
+            const resolvedWindow = aiResolveWindow(item, evidence, tableMatch?.rowLabel || '', tableMatch?.contextText || '', sourceContext);
             if (!resolvedWindow || !Number.isFinite(monthlyMultiplier(resolvedWindow))) {
                 issues.push('额度周期不明确，不能可靠折算');
             }
@@ -2792,7 +2813,7 @@
                     ? aiSourceTableMatch(item.plan, snapshot?.evidenceText || snapshot?.excerpt || '', type, item, item.evidence, knownPlans)
                     : null;
                 const resolvedWindow = type === 'quota' || type === 'estimate'
-                    ? aiResolveWindow(item, item.evidence, tableMatch?.rowLabel || '', tableMatch?.contextText || '')
+                    ? aiResolveWindow(item, item.evidence, tableMatch?.rowLabel || '', tableMatch?.contextText || '', aiEvidenceSourceContext(snapshot?.evidenceText || snapshot?.excerpt || '', item.evidence))
                     : '';
                 destination.push(resolvedWindow ? { ...item, window: resolvedWindow } : item);
                 if (issues.length) counts.accepted += 1;
