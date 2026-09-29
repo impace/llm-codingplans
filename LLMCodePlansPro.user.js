@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.15.6
+// @version      2.15.7
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.15.6';
+    const APP_VERSION = '2.15.7';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -243,7 +243,7 @@
     const MAX_AI_EVIDENCE_CHARS = 18000;
     const MAX_AI_FIELD_EVIDENCE_CHARS = 220;
     const MAX_AI_SOURCE_CHARS = 180000;
-    const AI_REVIEW_POLICY_VERSION = 2;
+    const AI_REVIEW_POLICY_VERSION = 3;
     const REQUEST_TOKEN_SCENARIOS = {
         conservative: 8000,
         baseline: 32000,
@@ -825,6 +825,16 @@
         return ({ CNY: '¥', USD: '$', EUR: '€', GBP: '£', JPY: '¥', KRW: '₩', INR: '₹', HKD: 'HK$', SGD: 'S$', AUD: 'A$', CAD: 'C$' })[code] || code;
     }
 
+    function isCnyMarketHost(url) {
+        try {
+            const host = new URL(url).hostname.toLowerCase();
+            return host.endsWith('.cn') || host.includes('bigmodel') || host.includes('volcengine') || host.includes('baidu')
+                || host.includes('aliyun') || host.includes('tencent') || host.includes('mimo.mi') || host.includes('kimi.com');
+        } catch {
+            return false;
+        }
+    }
+
     function inferCurrency(text, url) {
         const source = String(text || '');
         const explicit = source.match(/(?:currency|currency\s*code|币种|价格单位|prices?\s+in|priced\s+in|billing\s+in|金额)\s*[:：]?\s*(USD|EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/i)
@@ -845,14 +855,15 @@
             try {
                 const host = new URL(url).hostname;
                 if (host.endsWith('.jp') || host.includes('co.jp')) return 'JPY';
-                if (host.endsWith('.cn') || host.includes('bigmodel') || host.includes('volcengine') || host.includes('baidu') || host.includes('aliyun') || host.includes('tencent') || host.includes('mimo.mi') || host.includes('kimi.com')) return 'CNY';
+                if (isCnyMarketHost(url)) return 'CNY';
             } catch {}
             return 'UNKNOWN';
         }
-        if (/\bUS\s*\$|\$/.test(source)) return 'USD';
+        if (/\bUSD\b|\bUS\s*\$|美元/i.test(source)) return 'USD';
+        if (/\$/.test(source) && !isCnyMarketHost(url)) return 'USD';
         try {
             const host = new URL(url).hostname;
-            if (host.endsWith('.cn') || host.includes('bigmodel') || host.includes('volcengine') || host.includes('baidu') || host.includes('aliyun') || host.includes('tencent') || host.includes('mimo.mi') || host.includes('kimi.com')) return 'CNY';
+            if (isCnyMarketHost(url)) return 'CNY';
             if (host.endsWith('.jp')) return 'JPY';
             if (host.endsWith('.uk')) return 'GBP';
             if (host === 'github.com' || host.endsWith('.github.com') || host.endsWith('openai.com') || host.endsWith('x.ai') || host === 'grok.com') return 'USD';
@@ -884,9 +895,10 @@
         const displayCurrency = rates[normalizeCurrencyCode(settings.currency.display)] ? normalizeCurrencyCode(settings.currency.display) : 'CNY';
         const facts = [];
         const seen = new Set();
+        const allowBareDollar = !isCnyMarketHost(url) || /\bUSD\b|\bUS\s*\$|美元/i.test(source);
         const patterns = [
-            /(?:USD|US\$|(?<![A-Za-z])\$)\s*([0-9][0-9,.]*)/gi,
-            /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:USD|US\$|\$)(?!\s*[0-9])/gi,
+            allowBareDollar ? /(?:USD|US\$|(?<![A-Za-z])\$)\s*([0-9][0-9,.]*)/gi : /(?:USD|US\$)\s*([0-9][0-9,.]*)/gi,
+            allowBareDollar ? /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:USD|US\$|\$)(?!\s*[0-9])/gi : /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:USD|US\$)(?!\s*[0-9])/gi,
             /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:人民币|元)(?![A-Za-z])/gi,
             /(?<![¥￥€£₩₹A-Za-z])([0-9][0-9,.]*)\s*(?:EUR|GBP|JPY|CNY|RMB|HKD|KRW|INR|AUD|CAD|SGD)\b/gi,
             /(?:EUR|€)\s*([0-9][0-9,.]*)/gi,
@@ -912,7 +924,7 @@
                     try {
                         const host = new URL(url).hostname;
                         if (host.endsWith('.jp') || host.includes('co.jp')) currency = 'JPY';
-                        if (host.endsWith('.cn') || host.includes('bigmodel') || host.includes('volcengine') || host.includes('baidu') || host.includes('aliyun') || host.includes('tencent') || host.includes('mimo.mi') || host.includes('kimi.com')) currency = 'CNY';
+                        if (isCnyMarketHost(url)) currency = 'CNY';
                     } catch {}
                 }
                 if (currency === 'UNKNOWN' && !/[¥￥]/.test(token)) currency = inferred;
@@ -1118,6 +1130,73 @@
         };
     }
 
+    function normalizeAiBound(value, fallback = NaN) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) && numeric > 0 ? numeric : fallback;
+    }
+
+    function aiUnitScaleHint(value) {
+        const unit = String(value || '').normalize('NFKC').toLowerCase();
+        if (/\bb\s*(?:tokens?|credits?)|billion|十亿/.test(unit)) return 1e9;
+        if (/\bm\s*(?:tokens?|credits?)|million|百万/.test(unit)) return 1e6;
+        if (/\bk\s*(?:tokens?|credits?)|thousand|千/.test(unit)) return 1e3;
+        if (/亿/.test(unit)) return 1e8;
+        if (/万/.test(unit)) return 1e4;
+        return 1;
+    }
+
+    function inferAiScenario(row) {
+        const explicit = String(row?.scenario || row?.assumption || '').trim();
+        if (explicit) return explicit.slice(0, 120);
+        const evidence = String(row?.evidence || '').normalize('NFKC');
+        const labeled = evidence.match(/(?:缓存命中率|cache\s*hit(?:\s*rate)?|命中率)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%/i);
+        if (labeled) return ('缓存命中率 ' + labeled[1] + '%').slice(0, 120);
+        const percent = evidence.match(/(?:^|[|｜;；,，\s])(\d{1,3}(?:\.\d+)?)\s*%(?=$|[|｜;；,，\s])/);
+        return percent ? (percent[1] + '% 场景') : '';
+    }
+
+    function normalizeAiEstimateBounds(row, numericValue) {
+        let minTokens = normalizeAiBound(row?.minTokens ?? row?.estimatedMinTokens, NaN);
+        let maxTokens = normalizeAiBound(row?.maxTokens ?? row?.estimatedMaxTokens, NaN);
+        if (Number.isFinite(minTokens) || Number.isFinite(maxTokens)) {
+            minTokens = Number.isFinite(minTokens) ? minTokens : maxTokens;
+            maxTokens = Number.isFinite(maxTokens) ? maxTokens : minTokens;
+            return { minTokens: Math.min(minTokens, maxTokens), maxTokens: Math.max(minTokens, maxTokens) };
+        }
+        const evidence = String(row?.evidence || '').normalize('NFKC');
+        const ranges = [...evidence.matchAll(/(\d[\d,，]*(?:\.\d+)?)\s*[-~～至到]\s*(\d[\d,，]*(?:\.\d+)?)/g)]
+            .map(match => [Number(match[1].replace(/[,，]/g, '')), Number(match[2].replace(/[,，]/g, ''))])
+            .filter(([low, high]) => Number.isFinite(low) && Number.isFinite(high) && low > 0 && high >= low);
+        if (Number.isFinite(numericValue) && numericValue > 0 && ranges.length) {
+            const evidenceScales = [];
+            const lowerEvidence = evidence.toLowerCase();
+            if (/\bb\s*(?:tokens?|令牌)|billion|十亿/.test(lowerEvidence)) evidenceScales.push(1e9);
+            if (/\bm\s*(?:tokens?|令牌)|million|百万/.test(lowerEvidence)) evidenceScales.push(1e6);
+            if (/\bk\s*(?:tokens?|令牌)|thousand|千/.test(lowerEvidence)) evidenceScales.push(1e3);
+            if (/亿/.test(lowerEvidence)) evidenceScales.push(1e8);
+            if (/万/.test(lowerEvidence)) evidenceScales.push(1e4);
+            const unitScale = aiUnitScaleHint(row?.estimatedUnit || row?.unit);
+            if (unitScale > 1) evidenceScales.push(unitScale);
+            const commonScales = [...new Set([unitScale, 1, 10, 100, 1000, 1e4, 1e5, 1e6, 1e8, 1e9])];
+            let best = null;
+            ranges.forEach(([low, high]) => {
+                evidenceScales.forEach(scale => {
+                    const lowMetric = low * scale;
+                    const highMetric = high * scale;
+                    if (numericValue >= lowMetric * 0.98 && numericValue <= highMetric * 1.02) best ||= { low, high, scale, error: 0 };
+                });
+                [numericValue / low, numericValue / high].forEach(scale => {
+                    if (!Number.isFinite(scale) || scale <= 0) return;
+                    const reference = commonScales.reduce((current, candidate) => Math.abs(candidate - scale) < Math.abs(current - scale) ? candidate : current, commonScales[0]);
+                    const error = Math.abs(scale - reference) / reference;
+                    if (error <= 0.02 && (!best || error < best.error)) best = { low, high, scale: reference, error };
+                });
+            });
+            if (best) return { minTokens: best.low * best.scale, maxTokens: best.high * best.scale };
+        }
+        return { minTokens: numericValue, maxTokens: numericValue };
+    }
+
     function normalizeAiExtraction(value, rates) {
         const source = value && typeof value === 'object' ? value : {};
         const confidence = ['high', 'medium', 'low'].includes(String(source.confidence).toLowerCase())
@@ -1156,13 +1235,22 @@
         const modelEstimates = Array.isArray(source.modelEstimates) ? source.modelEstimates.slice(0, 40).map(item => {
             const row = item && typeof item === 'object' ? item : {};
             const numericValue = Number(row.estimatedTokens ?? row.value);
+            const bounds = normalizeAiEstimateBounds(row, numericValue);
+            const minTokens = bounds.minTokens;
+            const maxTokens = bounds.maxTokens;
+            const representativeTokens = Number.isFinite(minTokens) && Number.isFinite(maxTokens)
+                ? (minTokens + maxTokens) / 2
+                : numericValue;
             return {
                 plan: String(row.plan || '未标注套餐').trim().slice(0, 120),
                 model: String(row.model || row.modelName || '未标注模型').trim().slice(0, 160),
                 modelId: String(row.modelId || '').trim().slice(0, 160),
-                estimatedTokens: Number.isFinite(numericValue) ? numericValue : String(row.estimatedTokens ?? row.value ?? '').trim().slice(0, 80),
+                estimatedTokens: Number.isFinite(representativeTokens) ? representativeTokens : String(row.estimatedTokens ?? row.value ?? '').trim().slice(0, 80),
+                minTokens,
+                maxTokens: Math.max(minTokens, maxTokens),
                 estimatedUnit: String(row.estimatedUnit || row.unit || 'unknown').trim().slice(0, 40),
                 window: String(row.window || 'unknown').trim().slice(0, 30),
+                scenario: inferAiScenario(row),
                 basis: String(row.basis || '页面估算').trim().slice(0, 120),
                 evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
@@ -1253,6 +1341,8 @@
             'window 必须保留原始周期并尽量标准化为 monthly、weekly、daily、5h 等；同一套餐有月度和滚动窗口双重限制时，两项都要返回。',
             'Credits、积分、请求数和消息数不能猜测为 Token；分别使用 credits、points、requests、messages 等单位。',
             '如果页面提供“模型 × 套餐档位”的 Token 用量预估，必须单独放入 modelEstimates；这是按模型估算，不是固定套餐 Token，不要把不同模型相加。',
+            'Token 预估出现区间（例如 0.48~0.97M）时，必须用 minTokens 和 maxTokens 保留上下限，estimatedTokens 填区间中值；不要拆成两条，也不要只取下界。',
+            '同一模型因缓存命中率、输入输出比或其他假设给出多组区间时，每组单独返回，并把假设逐字放进 scenario；不要把不同场景误写成同一固定值。',
             '并发限制、并行数、QPS/RPM/TPM、每秒/每分钟/每小时速率、上下文长度/窗口、最大输入长度、最大输出长度、单次请求限制、单次调用限制都属于模型技术参数，不是套餐额度，也不是月度 Token 容量；不要放入 quotas 或 modelEstimates，放入 warnings 即可。',
             'prices 最多返回 20 条，quotas 最多返回 30 条，modelEstimates 最多返回 40 条，models 最多返回 30 条，warnings 最多返回 10 条。',
             '每条 evidence 最多 220 字，必须是证据包中的连续原文；不要把分开的表头行和数据行拼接，也不要自行插入 | 或补写文字。evidence 可以只引用目标套餐的原始数值片段，例如“原价 60 元/月 限时 39 元/月”或“45,000 Credits”；套餐名必须单独填写在 plan 字段。只要 plan、数值、单位/币种和周期能由证据及其相邻正文确认，就可以返回该记录；不要求 evidence 重复套餐名，也不要求把整张表复制进每条 evidence。无法确认套餐归属、周期或数值时，写入 warnings。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
@@ -1266,7 +1356,7 @@
                 pageCurrency: 'USD|EUR|GBP|JPY|CNY|HKD|KRW|UNKNOWN',
                 prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', evidence: '逐字复制的原始价格行' }],
                 quotas: [{ plan: '套餐名', value: 0, unit: 'tokens|K tokens|M tokens|B tokens|requests|messages|credits|points|unknown', window: '5h|daily|weekly|monthly|unknown', evidence: '逐字复制的原始额度行' }],
-                modelEstimates: [{ plan: '套餐档位', model: '模型名称', modelId: 'Model ID', estimatedTokens: 0, estimatedUnit: 'tokens|K tokens|万 tokens|M tokens|B tokens', window: 'monthly|weekly|daily|5h|unknown', basis: '官方页面估算/官方规则推算', evidence: '逐字复制的原始数据行' }],
+                modelEstimates: [{ plan: '套餐档位', model: '模型名称', modelId: 'Model ID', estimatedTokens: 0, minTokens: 0, maxTokens: 0, estimatedUnit: 'tokens|K tokens|万 tokens|亿 tokens|M tokens|B tokens', window: 'monthly|weekly|daily|5h|unknown', scenario: '缓存命中率/输入输出比等假设；无则留空', basis: '官方页面估算/官方规则推算', evidence: '逐字复制的原始数据行' }],
                 models: ['正文明确提及的模型'],
                 warnings: ['币种、地区、登录态或页面不确定性']
             }),
@@ -2197,7 +2287,10 @@
         }) : [];
         const estimates = Array.isArray(data.modelEstimates) ? data.modelEstimates.slice(0, 3).map(item => {
             const value = item.estimatedTokens === undefined || item.estimatedTokens === null ? '' : item.estimatedTokens;
-            return item.plan + ' · ' + item.model + ' ' + value + ' ' + (item.estimatedUnit || '') + '/' + (item.window || '');
+            const min = Number(item.minTokens);
+            const max = Number(item.maxTokens);
+            const displayValue = Number.isFinite(min) && Number.isFinite(max) && min !== max ? min + '~' + max : value;
+            return item.plan + ' · ' + item.model + ' ' + displayValue + ' ' + (item.estimatedUnit || '') + '/' + (item.window || '') + (item.scenario ? '（' + item.scenario + '）' : '');
         }) : [];
         const warnings = Array.isArray(data.warnings) ? data.warnings.slice(0, 2).join('、') : '';
         const pieces = [];
@@ -2516,6 +2609,7 @@
         if (/b\s*token|billion|十亿/.test(value)) return 'b-tokens';
         if (/m\s*token|million|百万/.test(value)) return 'm-tokens';
         if (/k\s*token|thousand|千/.test(value)) return 'k-tokens';
+        if (/亿\s*token/.test(value)) return 'yi-tokens';
         if (/万\s*token|ten[- ]?thousand/.test(value)) return 'wan-tokens';
         if (/token/.test(value)) return 'tokens';
         if (/request|call|message|次|请求|消息/.test(value)) return 'requests';
@@ -2551,7 +2645,7 @@
             ? [type, normalizePlanKey(item.plan), item.amount, normalizeCurrencyCode(item.currency), item.billingPeriod]
             : type === 'quota'
                 ? [type, normalizePlanKey(item.plan), item.value, item.unit, item.window]
-                : [type, normalizePlanKey(item.plan), normalizePlanKey(item.modelId || item.model), item.estimatedTokens, item.estimatedUnit, item.window];
+                : [type, normalizePlanKey(item.plan), normalizePlanKey(item.modelId || item.model), item.estimatedTokens, item.minTokens, item.maxTokens, item.estimatedUnit, item.window, item.scenario];
         return hashText(JSON.stringify(values.map(value => String(value ?? ''))));
     }
 
@@ -2569,18 +2663,45 @@
         return compactPlan.length >= 2 && normalizeAiEvidenceText(evidence).includes(compactPlan);
     }
 
+    function aiExpectedMetrics(type, item) {
+        const unit = type === 'quota' ? item.unit : item.estimatedUnit;
+        const rawValues = type === 'quota'
+            ? [item.value]
+            : [item.estimatedTokens, item.minTokens, item.maxTokens];
+        return rawValues.map(value => parseQuotaValue(value, unit))
+            .filter(value => Number.isFinite(value.value))
+            .map(value => ({ kind: aiBaseUnitKind(value.unit), metric: value.value * aiUnitScale(value.unit) }));
+    }
+
     function aiEvidenceContainsValue(type, item, evidence) {
         if (type === 'price') {
             const amount = Number(item.amount);
             return Number.isFinite(amount) && aiNumbersInText(evidence).some(value => Math.abs(value - amount) <= Math.max(1e-8, Math.abs(amount) * 1e-8));
         }
-        const parsed = type === 'quota'
-            ? parseQuotaValue(item.value, item.unit)
-            : parseQuotaValue(item.estimatedTokens, item.estimatedUnit);
-        const metric = Number.isFinite(parsed.value) ? parsed.value * aiUnitScale(parsed.unit) : NaN;
-        const kind = aiBaseUnitKind(parsed.unit);
-        return Number.isFinite(metric) && kind !== 'unknown'
-            && aiEvidenceQuantities(evidence).some(value => value.kind === kind && Math.abs(value.value - metric) <= Math.max(1e-8, Math.abs(metric) * 1e-6));
+        const expected = aiExpectedMetrics(type, item);
+        const actual = aiEvidenceQuantities(evidence);
+        return expected.some(candidate => candidate.kind !== 'unknown'
+            && actual.some(value => value.kind === candidate.kind
+                && Math.abs(value.value - candidate.metric) <= Math.max(1e-8, Math.abs(candidate.metric) * 1e-6)));
+    }
+
+    function aiCellContainsMetric(type, item, cell) {
+        if (aiEvidenceContainsValue(type, item, cell)) return true;
+        if (type === 'price') return false;
+        const expected = aiExpectedMetrics(type, item);
+        const numbers = aiNumbersInText(cell);
+        return expected.some(candidate => {
+            if (candidate.kind === 'unknown') return false;
+            const scales = candidate.kind === 'tokens' ? [1, 1e3, 1e4, 1e6, 1e8, 1e9] : [1];
+            return numbers.some(value => scales.some(scale => {
+                const metric = value * scale;
+                return Math.abs(metric - candidate.metric) <= Math.max(1e-8, Math.abs(candidate.metric) * 1e-6);
+            }));
+        });
+    }
+
+    function aiContextContainsValue(type, item, ...parts) {
+        return parts.some(part => part && aiEvidenceContainsValue(type, item, part));
     }
 
     function aiEvidenceSourceContext(sourceText, evidence) {
@@ -2604,10 +2725,10 @@
         const source = String(sourceText || '').normalize('NFKC');
         const declared = aiWindowKey(declaredWindow);
         const strongPatterns = {
-            monthly: /(?:每月|月度|订阅月|monthly)\s*(?:额度|限额|上限|配额|quota)|(?:额度|限额|上限|配额|quota)\s*(?:为|是|:|：)?\s*(?:每月|月度|monthly)/i,
-            weekly: /(?:每周|每\s*7\s*天|weekly)\s*(?:额度|限额|上限|配额|quota)|(?:额度|限额|上限|配额|quota)\s*(?:为|是|:|：)?\s*(?:每周|weekly)/i,
-            daily: /(?:每天|每日|daily)\s*(?:额度|限额|上限|配额|quota)|(?:额度|限额|上限|配额|quota)\s*(?:为|是|:|：)?\s*(?:每天|每日|daily)/i,
-            '5h': /(?:5\s*小时|5h)\s*(?:额度|限额|上限|配额|quota)|(?:额度|限额|上限|配额|quota)\s*(?:为|是|:|：)?\s*(?:5\s*小时|5h)/i
+            monthly: /(?:每月|月度|订阅月|monthly)\s*(?:(?:积分|点数|points?|credits?)\s*)?(?:额度|限额|上限|配额|quota)|(?:额度|限额|上限|配额|quota)\s*(?:为|是|:|：)?\s*(?:每月|月度|monthly)/i,
+            weekly: /(?:每周|每\s*7\s*天|weekly)\s*(?:(?:积分|点数|points?|credits?)\s*)?(?:额度|限额|上限|配额|quota)|(?:额度|限额|上限|配额|quota)\s*(?:为|是|:|：)?\s*(?:每周|weekly)/i,
+            daily: /(?:每天|每日|daily)\s*(?:(?:积分|点数|points?|credits?)\s*)?(?:额度|限额|上限|配额|quota)|(?:额度|限额|上限|配额|quota)\s*(?:为|是|:|：)?\s*(?:每天|每日|daily)/i,
+            '5h': /(?:每?\s*5\s*小时|5h)\s*(?:(?:积分|点数|points?|credits?)\s*)?(?:额度|限额|上限|配额|quota)|(?:额度|限额|上限|配额|quota)\s*(?:为|是|:|：)?\s*(?:每?\s*5\s*小时|5h)/i
         };
         if (declared && strongPatterns[declared]?.test(source)) return declared;
         const matched = Object.entries(strongPatterns).filter(([, pattern]) => pattern.test(source)).map(([key]) => key);
@@ -2634,6 +2755,13 @@
         return [];
     }
 
+    function aiCellHasQuotaValue(cell) {
+        const text = String(cell || '').normalize('NFKC');
+        if (/tokens?|credits?|points?|requests?|calls?|messages?|积分|点数|次|请求|调用/i.test(text)) return aiNumbersInText(text).length > 0;
+        if (/^\s*\d[\d,，]*(?:\.\d+)?\s*(?:[-~～至到]\s*\d[\d,，]*(?:\.\d+)?)?\s*(?:B|M|K|亿|万|billion|million|thousand|百万|十亿|千)?\s*$/i.test(text)) return true;
+        return false;
+    }
+
     function aiTableCandidateColumns(type, row) {
         return row.map((cell, index) => {
             const text = String(cell || '').trim();
@@ -2642,8 +2770,7 @@
                 return /(?:¥|￥|元|人民币|CNY|RMB|USD|US\$|美元|€|EUR|£|GBP|日元|JPY|港币|HKD|₩|KRW|\$)/i.test(text)
                     && aiNumbersInText(text).length ? index : null;
             }
-            return /(?:tokens?|credits?|points?|requests?|calls?|messages?|积分|点数|次|请求|调用)/i.test(text)
-                && aiNumbersInText(text).length ? index : null;
+            return aiCellHasQuotaValue(text) ? index : null;
         }).filter(index => index !== null);
     }
 
@@ -2665,7 +2792,8 @@
             rowIndex,
             headerIndex,
             column,
-            contextText: rows.slice(Math.max(0, rowIndex - 3), Math.min(rows.length, rowIndex + 4))
+            valueCell: String(row[column] || ''),
+            contextText: rows.slice(Math.max(0, rowIndex - 6), Math.min(rows.length, rowIndex + 7))
                 .flat()
                 .filter(Boolean)
                 .join(' | ')
@@ -2674,14 +2802,26 @@
         for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
             const dataRow = rows[rowIndex];
             const valueColumns = dataRow.map((cell, index) => ({ cell, index }))
-                .filter(({ cell }) => aiEvidenceContainsValue(type, item, cell))
+                .filter(({ cell }) => aiCellContainsMetric(type, item, cell))
                 .map(({ index }) => index);
             if (!valueColumns.length) continue;
             const candidateColumns = aiTableCandidateColumns(type, dataRow);
-            const allValueColumns = candidateColumns.length >= 2 ? candidateColumns : valueColumns;
+            const useCandidateColumns = candidateColumns.length >= 2 && valueColumns.every(index => candidateColumns.includes(index));
+            const allValueColumns = useCandidateColumns ? candidateColumns : valueColumns;
             const groupSize = planOrder.length && allValueColumns.length % planOrder.length === 0
                 ? allValueColumns.length / planOrder.length
                 : 0;
+
+            // 一些文档按“每个套餐一行、不同窗口分列”展示，例如 Lite | 2,000 | 10,000。
+            const ownedPlanColumn = dataRow.findIndex(cell => aiEvidenceContainsPlan(plan, cell));
+            if (ownedPlanColumn >= 0) {
+                const column = valueColumns.find(index => index !== ownedPlanColumn);
+                if (column !== undefined) {
+                    const rowLabel = rows.slice(Math.max(0, rowIndex - 3), Math.min(rows.length, rowIndex + 4)).flat()
+                        .filter(cell => /每月|每周|每日|小时|额度|限额|points?|credits?|积分|monthly|weekly|daily/i.test(cell)).join(' | ');
+                    return buildMatch(rowIndex, dataRow, column, rowIndex, rowLabel);
+                }
+            }
 
             // AI 有时会把“套餐表头 + 数据行”压成同一行：Lite | Essential | ... | 11,500 | 25,500 | ...。
             const inlinePlanColumns = dataRow.map((cell, index) => ({ cell, index }))
@@ -2734,6 +2874,26 @@
         return fallbackMatch;
     }
 
+    function aiTableContextSupportsItem(type, item, tableMatch, sourceContext = '') {
+        if (!tableMatch) return false;
+        const context = [tableMatch.rowLabel, tableMatch.contextText, sourceContext].filter(Boolean).join(' | ');
+        const evidence = String(item.evidence || '');
+        const unit = type === 'quota' ? item.unit : item.estimatedUnit;
+        const kind = aiBaseUnitKind(unit);
+        if (kind === 'unknown') return false;
+        const unitSupported = {
+            tokens: /tokens?|令牌/i,
+            credits: /credits?|points?|积分|点数|额度点/i,
+            requests: /requests?|calls?|messages?|请求|调用|消息|次数|次/i
+        }[kind]?.test(context);
+        const rawMetric = type === 'quota' ? Number(item.value) : Number(item.estimatedTokens);
+        const exactNumberSupported = Number.isFinite(rawMetric)
+            && aiNumbersInText([evidence, tableMatch.contextText, sourceContext].join(' | '))
+                .some(value => Math.abs(value - rawMetric) <= Math.max(1e-8, Math.abs(rawMetric) * 1e-8));
+        const matchedTableCell = aiCellContainsMetric(type, item, tableMatch.valueCell || '');
+        return Boolean(unitSupported && (matchedTableCell || aiContextContainsValue(type, item, evidence, tableMatch.contextText, sourceContext) || exactNumberSupported));
+    }
+
     function aiUnitScale(value) {
         const unit = String(value || '').normalize('NFKC').toLowerCase();
         if (/^(?:b|billion|十亿|亿)$/.test(unit) || /\bb\s*(?:tokens?|credits?)|billion|十亿|亿/.test(unit)) return /亿/.test(unit) && !/十亿/.test(unit) ? 1e8 : 1e9;
@@ -2754,6 +2914,14 @@
             if (Number.isFinite(value) && kind !== 'unknown') {
                 matches.push({ kind, value: value * aiUnitScale(match[2] || '') });
             }
+        }
+        const rangePattern = /(\d[\d,，]*(?:\.\d+)?)\s*[-~～至到]\s*(\d[\d,，]*(?:\.\d+)?)\s*(B|M|K|亿|万|billion|million|thousand|百万|十亿|千)?\s*(tokens?|令牌)/giu;
+        while ((match = rangePattern.exec(source))) {
+            const kind = aiBaseUnitKind(match[4]);
+            [match[1], match[2]].forEach(raw => {
+                const value = Number(String(raw).replace(/[,，]/g, ''));
+                if (Number.isFinite(value) && kind !== 'unknown') matches.push({ kind, value: value * aiUnitScale(match[3] || '') });
+            });
         }
         return matches;
     }
@@ -2816,6 +2984,13 @@
 
     function aiMetricValue(type, item) {
         if (type === 'price') return Number(item.amount);
+        if (type === 'estimate') {
+            const minParsed = parseQuotaValue(item.minTokens ?? item.estimatedTokens, item.estimatedUnit);
+            const maxParsed = parseQuotaValue(item.maxTokens ?? item.estimatedTokens, item.estimatedUnit);
+            const minMetric = Number.isFinite(minParsed.value) ? minParsed.value * aiUnitScale(minParsed.unit) : NaN;
+            const maxMetric = Number.isFinite(maxParsed.value) ? maxParsed.value * aiUnitScale(maxParsed.unit) : NaN;
+            return Number.isFinite(minMetric) && Number.isFinite(maxMetric) ? (minMetric + maxMetric) / 2 : NaN;
+        }
         const parsed = type === 'quota'
             ? parseQuotaValue(item.value, item.unit)
             : parseQuotaValue(item.estimatedTokens, item.estimatedUnit);
@@ -2830,7 +3005,7 @@
             if (!Number.isFinite(metric)) return;
             const groupKey = type === 'quota'
                 ? [type, normalizePlanKey(item.plan), aiBaseUnitKind(item.unit), aiWindowKey(item.window) || String(item.window || '').toLowerCase()].join('|')
-                : [type, normalizePlanKey(item.plan), normalizePlanKey(item.modelId || item.model), aiWindowKey(item.window) || String(item.window || '').toLowerCase()].join('|');
+                : [type, normalizePlanKey(item.plan), normalizePlanKey(item.modelId || item.model), aiWindowKey(item.window) || String(item.window || '').toLowerCase(), normalizeAiEvidenceText(item.scenario || item.basis)].join('|');
             if (!groups.has(groupKey)) groups.set(groupKey, []);
             groups.get(groupKey).push({ key: aiFieldKey(type, item), metric });
         };
@@ -2852,6 +3027,7 @@
             ? aiSourceTableMatch(item.plan, sourceText, type, item, evidence, knownPlans)
             : null;
         const sourceContext = aiEvidenceSourceContext(sourceText, evidence);
+        const tableContextSupported = type !== 'price' && aiTableContextSupportsItem(type, item, tableMatch, sourceContext);
         if (!item.plan || item.plan === '未标注套餐') {
             issues.push('AI 未提供明确套餐名');
         } else if (evidence && !aiEvidenceContainsPlan(item.plan, evidence)
@@ -2878,10 +3054,14 @@
                 : parseQuotaValue(item.estimatedTokens, item.estimatedUnit);
             const unit = parsed.unit;
             const kind = aiBaseUnitKind(unit);
-            const metric = Number.isFinite(parsed.value) ? parsed.value * aiUnitScale(unit) : NaN;
+            const minParsed = type === 'estimate' ? parseQuotaValue(item.minTokens ?? item.estimatedTokens, item.estimatedUnit) : parsed;
+            const maxParsed = type === 'estimate' ? parseQuotaValue(item.maxTokens ?? item.estimatedTokens, item.estimatedUnit) : parsed;
+            const minMetric = Number.isFinite(minParsed.value) ? minParsed.value * aiUnitScale(minParsed.unit) : NaN;
+            const maxMetric = Number.isFinite(maxParsed.value) ? maxParsed.value * aiUnitScale(maxParsed.unit) : NaN;
+            const metric = Number.isFinite(minMetric) && Number.isFinite(maxMetric) ? (minMetric + maxMetric) / 2 : NaN;
             if (!Number.isFinite(metric) || metric <= 0) issues.push('额度数值或单位无法安全解析');
             else if (kind === 'unknown') issues.push('额度单位不明确，无法分类');
-            else if (!aiEvidenceContainsValue(type, item, evidence)) {
+            else if (!aiEvidenceContainsValue(type, item, evidence) && !tableContextSupported) {
                 issues.push('原文证据中找不到相同数量级的数值和单位');
             }
             const resolvedWindow = aiResolveWindow(item, evidence, tableMatch?.rowLabel || '', tableMatch?.contextText || '', sourceContext, sourceText);
@@ -2961,6 +3141,7 @@
         if (kind === 'b-tokens') return amount;
         if (kind === 'm-tokens') return amount / 1000;
         if (kind === 'k-tokens') return amount / 1000000;
+        if (kind === 'yi-tokens') return amount / 10;
         if (kind === 'wan-tokens') return amount / 100000;
         if (kind === 'tokens') return amount / 1000000000;
         return NaN;
@@ -3008,18 +3189,25 @@
             estimates.forEach(estimate => {
                 if (!planMatches(row.plan, estimate.plan)) return;
                 const parsed = parseQuotaValue(estimate.estimatedTokens, estimate.estimatedUnit);
+                const minParsed = parseQuotaValue(estimate.minTokens ?? estimate.estimatedTokens, estimate.estimatedUnit);
+                const maxParsed = parseQuotaValue(estimate.maxTokens ?? estimate.estimatedTokens, estimate.estimatedUnit);
                 const value = parsed.value;
                 const kind = quotaUnitKind(parsed.unit);
                 const multiplier = monthlyMultiplier(estimate.window || 'monthly');
                 const monthlyB = tokenValueToB(value, kind) * multiplier;
-                if (!Number.isFinite(monthlyB)) return;
+                const minMonthlyB = tokenValueToB(minParsed.value, quotaUnitKind(minParsed.unit)) * multiplier;
+                const maxMonthlyB = tokenValueToB(maxParsed.value, quotaUnitKind(maxParsed.unit)) * multiplier;
+                if (!Number.isFinite(monthlyB) || !Number.isFinite(minMonthlyB) || !Number.isFinite(maxMonthlyB)) return;
                 modelEstimated.push({
                     model: estimate.model,
                     modelId: estimate.modelId,
                     monthlyB,
+                    minMonthlyB: Math.min(minMonthlyB, maxMonthlyB),
+                    maxMonthlyB: Math.max(minMonthlyB, maxMonthlyB),
                     value,
                     unit: parsed.unit,
                     window: estimate.window,
+                    scenario: estimate.scenario,
                     basis: estimate.basis,
                     evidence: estimate.evidence,
                     sourceUrl: link.url,
@@ -3087,7 +3275,7 @@
             });
             return [...best.values()];
         };
-        const uniqueEstimates = dedupeBy(modelEstimated, item => normalizePlanKey(item.modelId || item.model) + '|' + String(item.window || ''), 'monthlyB');
+        const uniqueEstimates = dedupeBy(modelEstimated, item => normalizePlanKey(item.modelId || item.model) + '|' + String(item.window || '') + '|' + normalizeAiEvidenceText(item.scenario || item.basis), 'monthlyB');
         const uniqueQuotas = dedupeBy(exact, item => String(item.window || ''), 'monthlyB');
         const uniqueRequests = dedupeBy(requests, item => normalizePlanKey(item.unit) + '|' + String(item.window || ''), 'monthlyRequests');
         const uniqueRelative = dedupeBy(relative, item => normalizePlanKey(item.unit) + '|' + String(item.window || ''), 'value');
@@ -3929,7 +4117,18 @@
                 '<div><span>购买数量</span><input class="llm-input-num" type="number" min="0" step="1" data-cart-quantity value="' + quantity + '" /><em>个</em></div>',
                 '</div>',
                 capacity?.kind === 'model-estimated-token'
-                    ? '<div class="llm-model-estimate-list">' + capacity.modelEstimates.map(item => '<div><span>' + escapeHtml(item.model) + (item.modelId ? ' · ' + escapeHtml(item.modelId) : '') + '</span><strong>' + escapeHtml(Number(item.monthlyB).toFixed(4)) + 'B Token/月</strong><em>' + (Number.isFinite(price.cny) && Number(item.monthlyB) > 0 ? '约 ¥' + (price.cny / item.monthlyB).toFixed(2) + '/B；' : '') + escapeHtml(item.basis || '页面估算') + '</em></div>').join('') + '</div>'
+                    ? '<div class="llm-model-estimate-list">' + capacity.modelEstimates.map(item => {
+                        const minB = Number(item.minMonthlyB);
+                        const maxB = Number(item.maxMonthlyB);
+                        const rangeText = Number.isFinite(minB) && Number.isFinite(maxB) && minB !== maxB
+                            ? minB.toFixed(4) + ' ~ ' + maxB.toFixed(4) + 'B Token/月'
+                            : Number(item.monthlyB).toFixed(4) + 'B Token/月';
+                        const unitCostText = Number.isFinite(price.cny) && minB > 0 && maxB > 0
+                            ? '约 ¥' + (price.cny / maxB).toFixed(2) + ' ~ ¥' + (price.cny / minB).toFixed(2) + '/B；'
+                            : (Number.isFinite(price.cny) && Number(item.monthlyB) > 0 ? '约 ¥' + (price.cny / item.monthlyB).toFixed(2) + '/B；' : '');
+                        const assumption = item.scenario ? item.scenario + '；' : '';
+                        return '<div><span>' + escapeHtml(item.model) + (item.modelId ? ' · ' + escapeHtml(item.modelId) : '') + '</span><strong>' + escapeHtml(rangeText) + '</strong><em>' + escapeHtml(unitCostText + assumption + (item.basis || '页面估算')) + '</em></div>';
+                    }).join('') + '</div>'
                     : '',
                 '<div class="llm-plan-note">' + escapeHtml(missingText + (capacity?.label || row.bottleneck || '暂无额度说明')) + '</div>',
                 capacity?.aiExceptionCounts?.pending ? '<div class="llm-plan-note llm-ai-calc-warning">有 ' + capacity.aiExceptionCounts.pending + ' 项 AI 额度证据异常，异常值未自动纳入；其他可核验数据和现有可靠数据仍照常测算。详情见动态更新雷达。</div>' : '',
