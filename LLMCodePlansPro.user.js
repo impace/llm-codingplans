@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.15.7
+// @version      2.15.9
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.15.7';
+    const APP_VERSION = '2.15.9';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -243,7 +243,7 @@
     const MAX_AI_EVIDENCE_CHARS = 18000;
     const MAX_AI_FIELD_EVIDENCE_CHARS = 220;
     const MAX_AI_SOURCE_CHARS = 180000;
-    const AI_REVIEW_POLICY_VERSION = 3;
+    const AI_REVIEW_POLICY_VERSION = 5;
     const REQUEST_TOKEN_SCENARIOS = {
         conservative: 8000,
         baseline: 32000,
@@ -976,9 +976,12 @@
         return (source.slice(0, 7000) + '\n---\n' + source.slice(-7000)).slice(0, MAX_AI_EXCERPT_CHARS);
     }
 
-    function buildAiEvidencePacket(text, url, deterministicFacts = {}, maxChars = 9000) {
+    function buildAiEvidencePacket(text, url, deterministicFacts = {}, maxChars = 9000, options = {}) {
         const normalized = normalizeAiSourceText(text);
-        const limit = Math.min(MAX_AI_EVIDENCE_CHARS, Math.max(4000, Number(maxChars) || 9000));
+        const sourceKind = String(options.sourceKind || '');
+        const isUpdateSource = sourceKind === 'updates';
+        const minimumLimit = isUpdateSource ? 1800 : 4000;
+        const limit = Math.min(MAX_AI_EVIDENCE_CHARS, Math.max(minimumLimit, Number(maxChars) || 9000));
         if (!normalized) return '';
 
         // HTTP/渲染正文经常把导航、面包屑和脚注重复拼接多次；这里仅对发送给 AI 的副本去重。
@@ -1018,7 +1021,11 @@
             return (meta + '\n[页面正文（已标准化）]\n' + source).slice(0, limit);
         }
 
-        const patterns = [
+        const patterns = isUpdateSource ? [
+            { category: '发布/变更事件', weight: 80, re: /新增|上线|发布|更新|升级|调整|变更|降价|涨价|下线|停用|弃用|迁移|开放|公测|release|launch|new|update|upgrade|change|price\s*cut|deprecat|sunset/gi },
+            { category: '模型/功能范围', weight: 65, re: /模型|智能体|知识库|检索|问答|声音|视频|图像|推理|代码|API|SDK|Model|Agent|function|feature|capabilit/gi },
+            { category: '生效信息', weight: 45, re: /生效|开始|截止|日期|时间|区域|版本|批次|支持|不再支持|effective|available|region|version/gi }
+        ] : [
             { category: '模型 Token 预估', weight: 70, re: /模型(?:名称|名|ID)?|Model\s*ID|token|tokens|输入|输出|缓存|命中|未命中|预估|测算/gi },
             { category: '价格/套餐', weight: 60, re: /价格|定价|套餐|月付|年付|原价|优惠|订阅|Lite|Essential|Standard|Pro\+?|Plus|Max|Heavy|Ultra|Team|Go|¥|￥|元|CNY|RMB|USD|EUR|GBP|JPY|HKD/gi },
             { category: '额度/扣费规则', weight: 55, re: /额度|限额|限制|请求|次数|消息|Credits?|积分|扣费|消耗|抵扣|每周|每月|每天|5\s*小时|窗口|quota|monthly|weekly|daily/gi },
@@ -1035,8 +1042,8 @@
             }
             const stride = Math.max(1, Math.ceil(matches.length / 90));
             matches.filter((_, index) => index % stride === 0 || index === matches.length - 1).forEach(matchIndex => {
-                const start = Math.max(0, matchIndex - 240);
-                const end = Math.min(source.length, matchIndex + 620);
+                const start = Math.max(0, matchIndex - (isUpdateSource ? 160 : 240));
+                const end = Math.min(source.length, matchIndex + (isUpdateSource ? 420 : 620));
                 const snippet = source.slice(start, end).trim();
                 if (snippet.length < 24) return;
                 let score = item.weight;
@@ -1062,8 +1069,8 @@
         const categoryCounts = {};
         let used = meta.length + 80;
         unique.forEach(candidate => {
-            if (selected.length >= 24) return;
-            const categoryLimit = candidate.category === '模型 Token 预估' ? 8 : 6;
+            if (selected.length >= (isUpdateSource ? 10 : 24)) return;
+            const categoryLimit = isUpdateSource ? 5 : (candidate.category === '模型 Token 预估' ? 8 : 6);
             if ((categoryCounts[candidate.category] || 0) >= categoryLimit) return;
             const overlaps = selected.some(item => {
                 const overlap = Math.min(item.end, candidate.end) - Math.max(item.start, candidate.start);
@@ -1085,16 +1092,240 @@
 
     function parseJsonFromModelText(value) {
         const fence = String.fromCharCode(96).repeat(3);
-        const raw = String(value || '').trim()
-            .replace(new RegExp('^' + fence + '(?:json)?\\s*', 'i'), '')
-            .replace(new RegExp('\\s*' + fence + '$'), '');
-        try { return JSON.parse(raw); } catch {}
-        const start = raw.indexOf('{');
-        const end = raw.lastIndexOf('}');
-        if (start >= 0 && end > start) {
-            try { return JSON.parse(raw.slice(start, end + 1)); } catch {}
+        const raw = String(value || '')
+            .replace(/^\uFEFF/, '')
+            .replace(new RegExp(fence + '(?:json)?\\s*', 'gi'), '')
+            .replace(new RegExp('\\s*' + fence, 'g'), '')
+            .trim();
+        const candidates = [];
+        const addCandidate = candidate => {
+            const text = String(candidate || '').trim();
+            if (text && !candidates.includes(text)) candidates.push(text);
+        };
+        addCandidate(raw);
+
+        // 提取第一个真正闭合的 JSON 对象，避免前后解释文字、示例或多个大括号干扰。
+        for (let start = raw.indexOf('{'); start >= 0; start = raw.indexOf('{', start + 1)) {
+            let depth = 0;
+            let quoted = false;
+            let escaped = false;
+            for (let index = start; index < raw.length; index += 1) {
+                const char = raw[index];
+                if (quoted) {
+                    if (escaped) escaped = false;
+                    else if (char === '\\') escaped = true;
+                    else if (char === '"') quoted = false;
+                    continue;
+                }
+                if (char === '"') quoted = true;
+                else if (char === '{') depth += 1;
+                else if (char === '}') {
+                    depth -= 1;
+                    if (depth === 0) {
+                        addCandidate(raw.slice(start, index + 1));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 仅做不会改变字段含义的语法清理；结构残缺时交给自动压缩重试。
+        for (const candidate of candidates) {
+            const variants = [candidate];
+            const withoutTrailingCommas = candidate.replace(/,\s*([}\]])/g, '$1');
+            if (withoutTrailingCommas !== candidate) variants.push(withoutTrailingCommas);
+            for (const variant of variants) {
+                try {
+                    const parsed = JSON.parse(variant);
+                    if (isAiExtractionObject(parsed)) return parsed;
+                } catch {}
+            }
         }
         return null;
+    }
+
+    // 模型偶尔会在 stop 状态下停在 JSON 中间。这里不猜测未完成的字段，
+    // 只保留已经完整结束的顶层字段和数组项，交给后面的证据核验继续筛选。
+    function prepareAiModelText(value) {
+        const fence = String.fromCharCode(96).repeat(3);
+        return String(value || '')
+            .replace(/^\uFEFF/, '')
+            .replace(new RegExp(fence + '(?:json)?\\s*', 'gi'), '')
+            .replace(new RegExp('\\s*' + fence, 'g'), '')
+            .trim();
+    }
+
+    function isAiExtractionObject(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+        return Object.keys(value).some(key => ['changeSummary', 'pageCurrency', 'prices', 'quotas', 'unclassifiedQuotas', 'modelEstimates', 'models', 'warnings'].includes(key));
+    }
+
+    function scanJsonStringValue(text, start) {
+        let escaped = false;
+        for (let index = start + 1; index < text.length; index += 1) {
+            const char = text[index];
+            if (escaped) escaped = false;
+            else if (char === '\\') escaped = true;
+            else if (char === '"') {
+                try {
+                    return { value: JSON.parse(text.slice(start, index + 1)), end: index + 1, complete: true };
+                } catch {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    function scanJsonCompositeValue(text, start) {
+        const stack = [text[start] === '{' ? '}' : ']'];
+        let quoted = false;
+        let escaped = false;
+        for (let index = start + 1; index < text.length; index += 1) {
+            const char = text[index];
+            if (quoted) {
+                if (escaped) escaped = false;
+                else if (char === '\\') escaped = true;
+                else if (char === '"') quoted = false;
+                continue;
+            }
+            if (char === '"') quoted = true;
+            else if (char === '{') stack.push('}');
+            else if (char === '[') stack.push(']');
+            else if (char === '}' || char === ']') {
+                if (stack[stack.length - 1] !== char) return null;
+                stack.pop();
+                if (!stack.length) {
+                    try {
+                        return { value: JSON.parse(text.slice(start, index + 1)), end: index + 1, complete: true };
+                    } catch {
+                        return null;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    function skipAiJsonWhitespace(text, start) {
+        let index = start;
+        while (index < text.length && /\s/.test(text[index])) index += 1;
+        return index;
+    }
+
+    function scanJsonArrayPrefix(text, start) {
+        if (text[start] !== '[') return null;
+        const values = [];
+        let index = start + 1;
+        while (index < text.length) {
+            index = skipAiJsonWhitespace(text, index);
+            if (text[index] === ']') return { value: values, end: index + 1, complete: true };
+            let item = null;
+            if (text[index] === '"') item = scanJsonStringValue(text, index);
+            else if (text[index] === '{' || text[index] === '[') item = scanJsonCompositeValue(text, index);
+            else {
+                const primitive = text.slice(index).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/);
+                if (primitive) {
+                    let value;
+                    try { value = JSON.parse(primitive[0]); } catch { value = undefined; }
+                    if (value !== undefined || primitive[0] === 'null') item = { value, end: index + primitive[0].length, complete: true };
+                }
+            }
+            if (!item || !item.complete) break;
+            values.push(item.value);
+            index = skipAiJsonWhitespace(text, item.end);
+            if (text[index] === ',') {
+                index += 1;
+                continue;
+            }
+            if (text[index] === ']') return { value: values, end: index + 1, complete: true };
+            break;
+        }
+        return values.length ? { value: values, end: index, complete: false } : null;
+    }
+
+    function scanJsonValueForRecovery(text, start) {
+        const index = skipAiJsonWhitespace(text, start);
+        if (text[index] === '"') return scanJsonStringValue(text, index);
+        if (text[index] === '{') return scanJsonCompositeValue(text, index);
+        if (text[index] === '[') return scanJsonArrayPrefix(text, index);
+        const primitive = text.slice(index).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/);
+        if (!primitive) return null;
+        let value;
+        try { value = JSON.parse(primitive[0]); } catch { return null; }
+        return { value, end: index + primitive[0].length, complete: true };
+    }
+
+    function recoverAiObjectPrefix(value) {
+        const raw = prepareAiModelText(value);
+        const candidates = [];
+        for (let start = raw.indexOf('{'); start >= 0; start = raw.indexOf('{', start + 1)) {
+            const result = {};
+            let index = start + 1;
+            let completed = 0;
+            while (index < raw.length) {
+                index = skipAiJsonWhitespace(raw, index);
+                if (raw[index] === '}') break;
+                if (raw[index] !== '"') break;
+                const keyPart = scanJsonStringValue(raw, index);
+                if (!keyPart) break;
+                index = skipAiJsonWhitespace(raw, keyPart.end);
+                if (raw[index] !== ':') break;
+                const parsed = scanJsonValueForRecovery(raw, index + 1);
+                if (!parsed) break;
+                result[keyPart.value] = parsed.value;
+                completed += 1;
+                index = skipAiJsonWhitespace(raw, parsed.end);
+                if (raw[index] === ',') {
+                    index += 1;
+                    continue;
+                }
+                if (raw[index] === '}') break;
+                break;
+            }
+            if (completed && isAiExtractionObject(result)) candidates.push({ result, completed });
+        }
+        candidates.sort((left, right) => right.completed - left.completed);
+        return candidates[0]?.result || null;
+    }
+
+    function parseAiModelJson(value, allowRecovery = true) {
+        const parsed = parseJsonFromModelText(value);
+        if (parsed) return { data: parsed, recovered: false };
+        if (!allowRecovery) return { data: null, recovered: false };
+        const recovered = recoverAiObjectPrefix(value);
+        return recovered ? { data: recovered, recovered: true } : { data: null, recovered: false };
+    }
+
+    function normalizeAiPlanName(value) {
+        const raw = String(value || '').normalize('NFKC').trim();
+        if (!raw || /^(?:unknown|n\/?a|none|null|undefined|未识别|未标注|未知|不详|无|pricing|pricing\s+plans?|plans?|套餐|套餐概览|套餐名称|plan\s+name)$/i.test(raw)) return '未标注套餐';
+        return raw.slice(0, 120);
+    }
+
+    function classifyAiQuotaRecord(item) {
+        const row = item && typeof item === 'object' ? item : {};
+        const text = [row.value, row.unit, row.window, row.evidence].map(value => String(value || '')).join(' ').normalize('NFKC');
+        const parsed = parseQuotaValue(row.value, row.unit);
+        const kind = aiBaseUnitKind(parsed.unit);
+        if (/\b(?:unlimited|unmetered|no\s+limit)\b|不限量|无限(?:制|量)?|无上限/i.test(text)) {
+            return { measurable: false, reason: '不限量描述没有可安全量化的数值' };
+        }
+        if (kind === 'unknown') return { measurable: false, reason: '非 Token、请求数或 Credits 的额度单位' };
+        if (!Number.isFinite(parsed.value) || parsed.value <= 0) return { measurable: false, reason: '额度没有可安全量化的正数值' };
+        return { measurable: true, reason: '' };
+    }
+
+    function normalizeUnclassifiedQuota(item, reason = '') {
+        const row = item && typeof item === 'object' ? item : {};
+        return {
+            plan: normalizeAiPlanName(row.plan),
+            value: row.value ?? '',
+            unit: String(row.unit || 'unknown').trim().slice(0, 40),
+            window: String(row.window || 'unknown').trim().slice(0, 30),
+            reason: String(reason || '').trim().slice(0, 160),
+            evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
+        };
     }
 
     function technicalLimitText(item) {
@@ -1208,7 +1439,7 @@
             const currency = normalizeCurrencyCode(row.currency);
             const amountCny = Number.isFinite(amount) ? convertToCny(amount, currency, rates) : NaN;
             return {
-                plan: String(row.plan || '未标注套餐').trim().slice(0, 120),
+                plan: normalizeAiPlanName(row.plan),
                 amount: Number.isFinite(amount) ? amount : null,
                 currency,
                 billingPeriod: String(row.billingPeriod || 'unknown').trim().slice(0, 30),
@@ -1217,19 +1448,26 @@
             };
         }).filter(item => item.amount !== null) : [];
         const technicalLimits = [];
+        const unclassifiedQuotas = Array.isArray(source.unclassifiedQuotas)
+            ? source.unclassifiedQuotas.slice(0, 30).map(item => normalizeUnclassifiedQuota(item, item?.reason || 'AI 标记为非标准额度'))
+            : [];
         const quotas = Array.isArray(source.quotas) ? source.quotas.slice(0, 30).map(item => {
             const row = item && typeof item === 'object' ? item : {};
-            const numericValue = Number(row.value);
             return {
-                plan: String(row.plan || '未标注套餐').trim().slice(0, 120),
-                value: Number.isFinite(numericValue) ? numericValue : String(row.value || '').trim().slice(0, 80),
+                plan: normalizeAiPlanName(row.plan),
+                value: typeof row.value === 'number' ? row.value : String(row.value ?? '').trim().slice(0, 80),
                 unit: String(row.unit || 'unknown').trim().slice(0, 30),
                 window: String(row.window || 'unknown').trim().slice(0, 30),
                 evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
         }).filter(item => {
-            if (!isTechnicalLimitRecord('quota', item)) return true;
-            technicalLimits.push(normalizeTechnicalLimit('quota', item));
+            if (isTechnicalLimitRecord('quota', item)) {
+                technicalLimits.push(normalizeTechnicalLimit('quota', item));
+                return false;
+            }
+            const classification = classifyAiQuotaRecord(item);
+            if (classification.measurable) return true;
+            unclassifiedQuotas.push(normalizeUnclassifiedQuota(item, classification.reason));
             return false;
         }) : [];
         const modelEstimates = Array.isArray(source.modelEstimates) ? source.modelEstimates.slice(0, 40).map(item => {
@@ -1242,7 +1480,7 @@
                 ? (minTokens + maxTokens) / 2
                 : numericValue;
             return {
-                plan: String(row.plan || '未标注套餐').trim().slice(0, 120),
+                plan: normalizeAiPlanName(row.plan),
                 model: String(row.model || row.modelName || '未标注模型').trim().slice(0, 160),
                 modelId: String(row.modelId || '').trim().slice(0, 160),
                 estimatedTokens: Number.isFinite(representativeTokens) ? representativeTokens : String(row.estimatedTokens ?? row.value ?? '').trim().slice(0, 80),
@@ -1261,6 +1499,7 @@
         }) : [];
         const warnings = Array.isArray(source.warnings) ? source.warnings.map(v => String(v).trim()).filter(Boolean).slice(0, 10) : [];
         if (technicalLimits.length) warnings.push('检测到 ' + technicalLimits.length + ' 项模型技术限制（并发、上下文或单次输入输出上限），已排除出额度与 Token 测算');
+        if (unclassifiedQuotas.length) warnings.push('检测到 ' + unclassifiedQuotas.length + ' 项不限量或非标准额度，已保留说明但未纳入 Token/请求次数测算');
         return {
             confidence,
             needsReview: source.needsReview !== false,
@@ -1268,6 +1507,7 @@
             pageCurrency: normalizeCurrencyCode(source.pageCurrency),
             prices,
             quotas,
+            unclassifiedQuotas: unclassifiedQuotas.slice(0, 30),
             modelEstimates,
             models: Array.isArray(source.models) ? source.models.map(v => String(v).trim()).filter(Boolean).slice(0, 30) : [],
             technicalLimits: technicalLimits.slice(0, 30),
@@ -1283,7 +1523,9 @@
         const timeoutSeconds = Math.min(300, Math.max(30, Number(ai.timeoutSeconds) || 120));
         const sourceKind = String(sourceResult.sourceKind || '');
         const isUpdateSource = sourceKind === 'updates';
-        const compactRetry = Boolean(sourceResult.aiCompactRetry);
+        const retryStage = Math.max(0, Math.min(2, Number(sourceResult.aiRetryStage) || (sourceResult.aiCompactRetry ? 1 : 0)));
+        const compactRetry = retryStage >= 1;
+        const minimalRetry = retryStage >= 2;
         if (!ai.enabled || !String(ai.apiKey || '').trim()) {
             return Promise.resolve({
                 ok: false,
@@ -1307,16 +1549,21 @@
         }
         const sourceText = String(sourceResult.aiSourceText || sourceResult.snapshotText || sourceResult.preview || '');
         const configuredEvidenceLimit = Math.max(4000, Number(ai.maxEvidenceChars) || 9000);
-        const evidenceLimit = Math.min(MAX_AI_EVIDENCE_CHARS, compactRetry ? 4000 : (isUpdateSource ? 5000 : configuredEvidenceLimit));
+        const evidenceLimit = Math.min(MAX_AI_EVIDENCE_CHARS,
+            minimalRetry ? (isUpdateSource ? 1800 : 2400)
+                : compactRetry ? (isUpdateSource ? 2200 : 3600)
+                    : (isUpdateSource ? 3600 : configuredEvidenceLimit));
         const text = buildAiEvidencePacket(
             sourceText,
             url,
             sourceResult.extractFacts || extractDeterministicFacts(sourceText, url),
-            evidenceLimit
+            evidenceLimit,
+            { sourceKind }
         );
         const evidenceDiagnostics = {
             sourceChars: sourceText.length,
-            evidenceChars: text.length
+            evidenceChars: text.length,
+            automaticRetries: retryStage
         };
         if (text.length < 120) return Promise.resolve({
             ok: false,
@@ -1325,40 +1572,55 @@
                 diagnostics: buildAiDiagnostics(endpoint, model, '请求前校验', { reason: '正文少于 120 字', ...evidenceDiagnostics })
         });
         const fx = parseFxRates(settings.currency.rates);
-        const prompt = [
-            '你是订阅与价格页面的数据审计器。请从下面脚本预处理后的官方页面证据包中抽取结构化数据。',
-            isUpdateSource
-                ? '当前来源是更新公告或模型发版记录：只总结本页直接说明的新增、下线、降价或能力变化；prices、quotas、modelEstimates 必须返回空数组。changeSummary 不超过 300 字，models 最多 12 项，warnings 最多 5 项。'
-                : '当前来源是定价或额度规则页面：只抽取能够用于套餐比较的价格、额度和扣费规则。',
-            compactRetry ? '这是输出截断后的自动压缩重试：只保留最关键结果，严禁解释分析过程，所有数组尽量精简。' : '',
-            '你收到的不是完整网页，而是脚本筛选后的证据包；只允许依据证据包中明确出现的内容。',
-            '证据包中的标签用于说明片段类别，不代表脚本已经确认其含义；不要补全缺失表格或猜测未出现的数据。',
-            '只允许依据正文明确出现的信息，不要猜测隐藏价格、Token容量、地区或套餐额度。',
-            '金额必须保留页面原始币种；如果页面没有明确币种，返回 UNKNOWN，不要根据访问者IP猜币种。',
-            'amountCny 可以省略；脚本会根据给定汇率在本地重新计算。不要为了填写 amountCny 重复解释金额。',
+        const taskInstructions = isUpdateSource ? [
+            '当前来源是更新公告或模型发版记录，只总结证据包直接说明的新增、下线、降价或能力变化。',
+            '不要从更新公告生成套餐价格、套餐额度或 Token 容量；只填写 changeSummary、models 和 warnings。',
+            'changeSummary 最多 180 字；models 最多 10 项；warnings 最多 5 项。没有明确变化时用一句话说明本页未识别到可确认变化。',
+            minimalRetry ? '这是第二次自动重试：只返回 changeSummary、最多 3 条 models 和 2 条 warnings；不要复述证据包。' : '',
+            compactRetry ? '这是自动压缩重试：只保留最关键的变更，禁止解释分析过程。' : ''
+        ] : [
+            '当前来源是定价或额度规则页面：只抽取能够用于套餐比较的价格、额度和扣费规则。',
+            compactRetry ? '这是自动压缩重试：严禁解释分析过程，只返回证据中最关键的结果。' : '',
+            minimalRetry ? '这是第二次自动重试。只返回确定看见的最少字段：价格页最多 3 条 prices、3 条 quotas、3 条 modelEstimates、3 条 unclassifiedQuotas、3 条 models、2 条 warnings；更新页只返回 changeSummary、最多 3 条 models 和 2 条 warnings。没有证据的数组必须为空。' : '',
+            '金额必须保留页面原始币种；如果页面没有明确币种，返回 UNKNOWN，不要根据访问者IP猜币种。amountCny 可以省略，脚本会根据给定汇率在本地重新计算。',
             '页面正文可能包含导航、营销文案、重复内容；请优先使用套餐表、价格表、额度表。',
+            'plan 必须填写价格或额度实际所属的套餐标题；UNKNOWN、N/A、未知都要写成“未标注套餐”。如果证据片段本身没有套餐名，请结合紧邻标题或同一表格列判断；无法唯一对应时不要猜，保留“未标注套餐”并写入 warnings。',
             '额度的 value 与 unit 必须共同保留数量级：例如 100M Tokens 返回 value=100、unit="M tokens"，11B Tokens 返回 value=11、unit="B tokens"；不要把 M/B 丢掉。',
             'window 必须保留原始周期并尽量标准化为 monthly、weekly、daily、5h 等；同一套餐有月度和滚动窗口双重限制时，两项都要返回。',
             'Credits、积分、请求数和消息数不能猜测为 Token；分别使用 credits、points、requests、messages 等单位。',
+            'Unlimited、不限量、inline suggestions 等没有可安全量化数值或不属于 tokens/requests/messages/credits/points 的权益，不要伪造 value=0，也不要放入 quotas；放入 unclassifiedQuotas，并说明为什么未纳入测算。',
             '如果页面提供“模型 × 套餐档位”的 Token 用量预估，必须单独放入 modelEstimates；这是按模型估算，不是固定套餐 Token，不要把不同模型相加。',
             'Token 预估出现区间（例如 0.48~0.97M）时，必须用 minTokens 和 maxTokens 保留上下限，estimatedTokens 填区间中值；不要拆成两条，也不要只取下界。',
             '同一模型因缓存命中率、输入输出比或其他假设给出多组区间时，每组单独返回，并把假设逐字放进 scenario；不要把不同场景误写成同一固定值。',
             '并发限制、并行数、QPS/RPM/TPM、每秒/每分钟/每小时速率、上下文长度/窗口、最大输入长度、最大输出长度、单次请求限制、单次调用限制都属于模型技术参数，不是套餐额度，也不是月度 Token 容量；不要放入 quotas 或 modelEstimates，放入 warnings 即可。',
-            'prices 最多返回 20 条，quotas 最多返回 30 条，modelEstimates 最多返回 40 条，models 最多返回 30 条，warnings 最多返回 10 条。',
-            '每条 evidence 最多 220 字，必须是证据包中的连续原文；不要把分开的表头行和数据行拼接，也不要自行插入 | 或补写文字。evidence 可以只引用目标套餐的原始数值片段，例如“原价 60 元/月 限时 39 元/月”或“45,000 Credits”；套餐名必须单独填写在 plan 字段。只要 plan、数值、单位/币种和周期能由证据及其相邻正文确认，就可以返回该记录；不要求 evidence 重复套餐名，也不要求把整张表复制进每条 evidence。无法确认套餐归属、周期或数值时，写入 warnings。只返回与价格、额度、模型或扣费规则直接相关的记录；相同模型和套餐不要重复返回。',
-            '没有同时看到明确模型、套餐和 Token 数值时，不要生成 modelEstimates；请求次数、Credits、积分不能转成 Token。',
-            '必须输出紧凑且完整的 JSON，确保最后一个字段和所有括号闭合。',
-            '必须只返回 JSON，不要 Markdown 代码围栏。JSON 字段：',
-            JSON.stringify({
+            'prices 最多返回 12 条，quotas 最多返回 16 条，unclassifiedQuotas 最多返回 12 条，modelEstimates 最多返回 20 条，models 最多返回 12 条，warnings 最多返回 6 条。',
+            '每条 evidence 最多 160 字，必须是证据包中的连续原文；不要把分开的表头行和数据行拼接，也不要自行插入 | 或补写文字。证据可以只引用目标数值片段，套餐名必须单独填写在 plan 字段。无法确认套餐归属、周期或数值时写入 warnings；相同模型和套餐不要重复返回。',
+            '没有同时看到明确模型、套餐和 Token 数值时，不要生成 modelEstimates；请求次数、Credits、积分不能转成 Token。'
+        ].filter(Boolean);
+        const prompt = [
+            '你是订阅与价格页面的数据审计器。请从下面脚本预处理后的官方页面证据包中抽取结构化数据。',
+            ...taskInstructions,
+            '你收到的不是完整网页，而是脚本筛选后的证据包；只允许依据证据包中明确出现的内容。',
+            '证据包中的标签用于说明片段类别，不代表脚本已经确认其含义；不要补全缺失表格或猜测未出现的数据。',
+            '只允许依据正文明确出现的信息，不要猜测隐藏价格、Token容量、地区或套餐额度。',
+            '必须输出紧凑且完整的 JSON，确保最后一个字段和所有括号闭合。不要输出任何分析过程、前言、后记或 Markdown。',
+            '必须只返回 JSON，不要 Markdown 代码围栏。字段顺序必须遵循下面示例；changeSummary 必须最后输出且不超过 120 字，避免长说明挤掉前面的可用数据。',
+            JSON.stringify(isUpdateSource ? {
                 confidence: 'high|medium|low',
-                needsReview: true,
-                changeSummary: '本次页面变化的简短说明',
+                needsReview: false,
+                models: ['正文明确提及的关键模型，最多10项'],
+                warnings: ['页面范围或不确定性，最多5项'],
+                changeSummary: '本页直接说明的新增、下线、降价或能力变化，最多120字'
+            } : {
+                confidence: 'high|medium|low',
                 pageCurrency: 'USD|EUR|GBP|JPY|CNY|HKD|KRW|UNKNOWN',
                 prices: [{ plan: '套餐名', amount: 0, currency: 'USD', billingPeriod: 'monthly|yearly|one_time|unknown', evidence: '逐字复制的原始价格行' }],
                 quotas: [{ plan: '套餐名', value: 0, unit: 'tokens|K tokens|M tokens|B tokens|requests|messages|credits|points|unknown', window: '5h|daily|weekly|monthly|unknown', evidence: '逐字复制的原始额度行' }],
+                unclassifiedQuotas: [{ plan: '套餐名或未标注套餐', value: '页面原值', unit: '原始单位', window: '原始周期或unknown', reason: '未纳入测算的原因', evidence: '逐字复制的原文' }],
                 modelEstimates: [{ plan: '套餐档位', model: '模型名称', modelId: 'Model ID', estimatedTokens: 0, minTokens: 0, maxTokens: 0, estimatedUnit: 'tokens|K tokens|万 tokens|亿 tokens|M tokens|B tokens', window: 'monthly|weekly|daily|5h|unknown', scenario: '缓存命中率/输入输出比等假设；无则留空', basis: '官方页面估算/官方规则推算', evidence: '逐字复制的原始数据行' }],
                 models: ['正文明确提及的模型'],
-                warnings: ['币种、地区、登录态或页面不确定性']
+                warnings: ['币种、地区、登录态或页面不确定性'],
+                changeSummary: '本次页面变化的简短说明，最多120字'
             }),
             '当前显示币种设置：' + (settings.currency.display || 'CNY'),
             '汇率（1 外币 = 多少 CNY）：' + JSON.stringify(fx),
@@ -1381,9 +1643,9 @@
                 data: JSON.stringify({
                     model: String(ai.model || 'gpt-4o-mini'),
                     temperature: 0,
-                    max_tokens: compactRetry ? 5500 : (isUpdateSource ? 3500 : 5000),
+                    max_tokens: minimalRetry ? (isUpdateSource ? 700 : 1000) : compactRetry ? (isUpdateSource ? 1000 : 2000) : (isUpdateSource ? 1500 : 3600),
                     messages: [
-                        { role: 'system', content: '你是 JSON 抽取器。禁止输出思考过程、解释或 Markdown；回复首字符必须是 {，末字符必须是 }。' },
+                        { role: 'system', content: '你是 JSON 抽取器。只输出一个完整 JSON 对象，不要输出思考过程、解释、前后缀或 Markdown。' },
                         { role: 'user', content: prompt }
                     ]
                 }),
@@ -1411,21 +1673,35 @@
                         const content = extracted.content;
                         diagnostics.finishReason = extracted.finishReason;
                         diagnostics.responseStructure = extracted.structureSummary;
-                        const parsed = parseJsonFromModelText(content);
+                        // 前两轮只接受完整 JSON；最后一轮才启用“已完成字段恢复”，
+                        // 避免第一次截断就过早结束，漏掉后续套餐或模型。
+                        const parsedResult = parseAiModelJson(content, retryStage >= 2);
+                        const parsed = parsedResult.data;
                         if (!parsed || typeof parsed !== 'object') {
-                            if (/^length$/i.test(extracted.finishReason) && !compactRetry) {
-                                requestAiExtraction(url, { ...sourceResult, aiCompactRetry: true }, reason + '；首次输出达到长度上限，自动压缩重试').then(resolve);
+                            if (retryStage < 2) {
+                                const retryCause = /^length$/i.test(extracted.finishReason)
+                                    ? '模型输出达到长度上限'
+                                    : '模型输出无法解析为完整 JSON';
+                                requestAiExtraction(url, { ...sourceResult, aiRetryStage: retryStage + 1 }, reason + '；' + retryCause + '，自动压缩重试').then(resolve);
                                 return;
                             }
                             const contentSummary = sanitizeAiDiagnosticText(content || extracted.reasoning || summarizeAiResponse(responseText));
                             const truncation = /^length$/i.test(extracted.finishReason) ? '；模型输出达到长度上限，JSON 未闭合' : '';
-                            resolve({ ok: false, error: 'AI 返回不是有效 JSON' + truncation + '；模型输出摘要：' + contentSummary, diagnostics: { ...diagnostics, phase: '模型内容解析' } });
+                            resolve({ ok: false, error: 'AI 返回不是有效 JSON' + truncation + '；已自动重试 ' + retryStage + ' 次；模型输出摘要：' + contentSummary, diagnostics: { ...diagnostics, phase: '模型内容解析' } });
                             return;
                         }
                         const normalized = normalizeAiExtraction(parsed, fx);
+                        if (parsedResult.recovered) {
+                            normalized.confidence = normalized.confidence === 'high' ? 'medium' : 'low';
+                            normalized.needsReview = true;
+                            normalized.warnings = [...new Set(['模型 JSON 未完整闭合，脚本仅恢复了已完成字段；未完成字段未纳入结果', ...normalized.warnings])].slice(0, 10);
+                            diagnostics.recoveredPartialJson = true;
+                            diagnostics.phase = '模型内容部分恢复';
+                        }
                         if (isUpdateSource) {
                             normalized.prices = [];
                             normalized.quotas = [];
+                            normalized.unclassifiedQuotas = [];
                             normalized.modelEstimates = [];
                         }
                         resolve({
@@ -1513,17 +1789,20 @@
             : (result.changed ? '页面正文指纹发生变化' : '首次检查或确定性抽取置信度不足');
         const aiResult = await requestAiExtraction(url, result, reason);
         if (aiResult.ok) {
+            const partialAiResult = Boolean(aiResult.diagnostics?.recoveredPartialJson);
             result.aiExtraction = aiResult.data;
             delete result.previousAiExtraction;
             result.aiReused = false;
-            result.aiStatus = 'AI提取完成，正在自动核验证据';
+            result.aiStatus = partialAiResult
+                ? 'AI提取完成但结果不完整：仅采用已完成字段，未完成字段未纳入测算'
+                : 'AI提取完成，正在自动核验证据';
             result.aiCheckedAt = aiResult.checkedAt;
             result.aiModel = aiResult.model;
             result.aiDiagnostics = aiResult.diagnostics || null;
             saveAiSnapshot(url, {
                 sourceKind: result.sourceKind,
                 fingerprint: result.fingerprint || '',
-                status: '自动筛选',
+                status: partialAiResult ? '部分恢复' : '自动筛选',
                 reviewPolicyVersion: AI_REVIEW_POLICY_VERSION,
                 fieldDecisions: {},
                 checkedAt: aiResult.checkedAt,
@@ -1894,9 +2173,14 @@
         if (!node) return '';
         let hasTable = false;
         try { hasTable = Boolean(node.matches?.('table, [role="table"], [role="grid"]') || node.querySelector('table, [role="table"], [role="grid"]')); } catch {}
-        if (!hasTable) return String(node.innerText || node.textContent || '').trim();
+        const fallbackText = String(node.innerText || node.textContent || '').trim();
+        if (!hasTable) {
+            const structural = extractRenderedPlanBlocks(node);
+            return structural ? structural + '\n[页面其余正文]\n' + fallbackText : fallbackText;
+        }
         let clone;
-        try { clone = node.cloneNode(true); } catch { return String(node.innerText || node.textContent || '').trim(); }
+        try { clone = node.cloneNode(true); } catch { return fallbackText; }
+        const structural = extractRenderedPlanBlocks(node);
         const tables = [];
         if (clone.matches?.('table, [role="table"], [role="grid"]')) tables.push(clone);
         try { tables.push(...clone.querySelectorAll('table, [role="table"], [role="grid"]')); } catch {}
@@ -1929,7 +2213,37 @@
                 table.replaceWith(pre);
             } catch {}
         });
-        return rootTableText || String(clone.innerText || clone.textContent || '').trim();
+        const tableText = rootTableText || String(clone.innerText || clone.textContent || '').trim();
+        return structural ? structural + '\n[页面其余正文]\n' + tableText : tableText;
+    }
+
+    function extractRenderedPlanBlocks(node) {
+        const blocks = [];
+        const seen = new Set();
+        const tierPattern = /^(?:Free|Go|Lite|Essential|Standard|Pro\+?|Plus|Max|Heavy|Ultra|Team)(?:\s+(?:plan|套餐|版))?$/i;
+        try {
+            node.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"],[class*="plan"],[class*="pricing"],[class*="tier"],[class*="package"]').forEach(element => {
+                const ownText = String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!tierPattern.test(ownText)) return;
+                let container = element;
+                for (let depth = 0; depth < 5 && container.parentElement; depth += 1) {
+                    const parent = container.parentElement;
+                    const text = String(parent.innerText || parent.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (text.length > 24 && text.length <= 900 && /(?:¥|￥|元|人民币|CNY|RMB|USD|US\$|美元|€|EUR|£|GBP|JPY|HKD|\$)\s*\d|\d\s*(?:元|USD|美元|每月|每年|per\s+month|per\s+year)/i.test(text)) {
+                        container = parent;
+                        break;
+                    }
+                    if (text.length > 1200) break;
+                    container = parent;
+                }
+                const text = String(container.innerText || container.textContent || '').replace(/\r\n?/g, '\n').replace(/[ \t]+/g, ' ').trim();
+                const fingerprint = normalizeAiEvidenceText(text);
+                if (!text || text.length > 1200 || seen.has(fingerprint)) return;
+                seen.add(fingerprint);
+                blocks.push('[套餐卡]\n' + text + '\n[/套餐卡]');
+            });
+        } catch {}
+        return blocks.join('\n');
     }
 
     function extractRenderedText(rule) {
@@ -2285,6 +2599,7 @@
             const value = item.value === undefined || item.value === null ? '' : item.value;
             return item.plan + ' ' + value + ' ' + (item.unit || '') + '/' + (item.window || '');
         }) : [];
+        const unclassifiedCount = Array.isArray(data.unclassifiedQuotas) ? data.unclassifiedQuotas.length : 0;
         const estimates = Array.isArray(data.modelEstimates) ? data.modelEstimates.slice(0, 3).map(item => {
             const value = item.estimatedTokens === undefined || item.estimatedTokens === null ? '' : item.estimatedTokens;
             const min = Number(item.minTokens);
@@ -2296,6 +2611,7 @@
         const pieces = [];
         if (prices.length) pieces.push('价格 ' + prices.join('、'));
         if (quotas.length) pieces.push('额度 ' + quotas.join('、'));
+        if (unclassifiedCount) pieces.push('另有 ' + unclassifiedCount + ' 项非标准额度已保留说明但未纳入测算');
         if (estimates.length) pieces.push('按模型估算 ' + estimates.join('、'));
         if (changes) pieces.push(changes);
         if (data.pageCurrency) pieces.push('页面币种 ' + normalizeCurrencyCode(data.pageCurrency));
@@ -2310,13 +2626,15 @@
         if (snapshot.data) {
             const review = getAiSnapshotReview(snapshot);
             if (review.unsupported) return '旧版 AI 结果已停用，请重新抓取分析';
+            const partial = Boolean(snapshot.diagnostics?.recoveredPartialJson || status === '部分恢复');
             const applied = review.counts.automatic + review.counts.accepted;
             const reviewLabel = review.counts.pending
                 ? '已自动采用 ' + applied + ' 项，' + review.counts.pending + ' 项证据异常待处理'
                 : review.counts.ignored && !applied
                     ? '异常字段已忽略，未用于测算'
                     : '已自动筛选并采用 ' + applied + ' 项' + (review.counts.ignored ? '，另忽略 ' + review.counts.ignored + ' 项' : '');
-            return '最近 AI 结果（' + reviewLabel + '）：' + formatAiSnapshot({ data: review.data });
+            const partialLabel = partial ? '结果部分恢复，未完成字段未纳入测算；' : '';
+            return '最近 AI 结果（' + partialLabel + reviewLabel + '）：' + formatAiSnapshot({ data: review.data });
         }
         if (status === '失败' || status === '未执行' || status === '未复核') {
             const cleanError = String(snapshot.error || '')
@@ -2358,7 +2676,14 @@
             };
             const review = getAiSnapshotReview(reviewSnapshot);
             if (review.unsupported) return { kind: 'action', label: '旧版 AI 数据已停用，请重新抓取分析', color: '#e3b341' };
+            const partial = Boolean(displayProbe.aiDiagnostics?.recoveredPartialJson || snapshot?.diagnostics?.recoveredPartialJson || snapshot?.status === '部分恢复' || /结果不完整/.test(status));
             const applied = review.counts.automatic + review.counts.accepted;
+            if (partial && review.counts.pending) {
+                return { kind: 'attention', label: 'AI结果不完整：已采用 ' + applied + ' 项；另有 ' + review.counts.pending + ' 项证据异常待处理，未完成字段未纳入测算', color: '#e3b341' };
+            }
+            if (partial) {
+                return { kind: 'attention', label: 'AI结果不完整：已采用 ' + applied + ' 项；未完成字段未纳入测算，建议重新分析', color: '#e3b341' };
+            }
             if (review.counts.pending) {
                 return { kind: 'attention', label: 'AI数据：' + applied + ' 项已自动采用；' + review.counts.pending + ' 项证据异常待处理', color: '#e3b341' };
             }
@@ -2409,6 +2734,7 @@
             Number.isFinite(Number(diagnostics.elapsedMs)) ? '耗时 ' + Number(diagnostics.elapsedMs).toLocaleString() + ' ms' : '',
             Number.isFinite(Number(diagnostics.sourceChars)) ? '原始正文 ' + Number(diagnostics.sourceChars).toLocaleString() + ' 字' : '',
             Number.isFinite(Number(diagnostics.evidenceChars)) ? '证据包 ' + Number(diagnostics.evidenceChars).toLocaleString() + ' 字' : '',
+            Number(diagnostics.automaticRetries) > 0 ? '自动重试 ' + Number(diagnostics.automaticRetries) + ' 次' : '',
             diagnostics.reason ? '原因 ' + diagnostics.reason : ''
         ].filter(Boolean);
         return parts.join('；');
@@ -2418,6 +2744,7 @@
         if (!diagnostics || typeof diagnostics !== 'object') return '';
         const status = Number(diagnostics.httpStatus) || 0;
         const phase = String(diagnostics.phase || '');
+        if (diagnostics.recoveredPartialJson || phase === '模型内容部分恢复') return '接口调用成功，但模型 JSON 未完整闭合；脚本只保留了已完成字段，未完成字段未纳入测算，建议重新分析';
         if (phase === '请求前校验') return '请求未发送：请先解决正文完整性问题';
         if (phase === '配置检查') return '请求未发送：请检查 AI 开关、API Key 与 Endpoint';
         if (/网络错误$/.test(phase)) return '请求未取得 HTTP 响应：检查网络、代理、DNS、跨域连接策略或接口可达性';
@@ -2446,6 +2773,7 @@
         const aiStatus = String(displayProbe.aiStatus || '').trim();
         const snapshotStatus = String(snapshot?.status || '').trim();
         const effectiveStatus = aiStatus || snapshotStatus;
+        const partialJson = Boolean(displayProbe.aiDiagnostics?.recoveredPartialJson || snapshot?.diagnostics?.recoveredPartialJson || snapshotStatus === '部分恢复' || /结果不完整/.test(effectiveStatus));
         const aiFailed = /^AI失败/.test(aiStatus) || (!aiStatus && snapshotStatus === '失败');
         const aiNotExecuted = /^AI未执行/.test(aiStatus) || (!aiStatus && snapshotStatus === '未执行');
         const failureText = aiFailed
@@ -2476,6 +2804,9 @@
                     + (review.counts.ignored ? '；已忽略 ' + review.counts.ignored + ' 项' : '')
                     + (review.counts.pending ? '；' + review.counts.pending + ' 项异常未纳入测算' : '');
                 parts.push(label + escapeHtml(formatAiSnapshot({ data: review.data })) + '；' + escapeHtml(summary));
+                if (partialJson) {
+                    parts.push('<span style="color:#e3b341;">AI警告：本次响应 JSON 未完整闭合，仅采用已完成字段；未完成字段未纳入测算，建议重新分析。</span>');
+                }
                 if (review.exceptions.length) {
                     const statusText = exception => exception.decision === 'accepted'
                         ? '<span class="llm-ai-exception-accepted">已按你的选择采用（仍有疑点）</span>'
@@ -2507,13 +2838,14 @@
         } else if (aiNotExecuted && stateText && diagnosticText) {
             parts.push('AI状态：' + escapeHtml(stateText));
         }
-        const hasAiIssue = aiFailed || aiNotExecuted || /未复核/.test(effectiveStatus) || Boolean(diagnosticAdvice);
+        const hasAiIssue = aiFailed || aiNotExecuted || /未复核/.test(effectiveStatus) || partialJson;
         if (diagnosticText && hasAiIssue) {
             const copyText = 'AI诊断：' + diagnosticText
                 + (diagnosticAdvice ? '\n初步判断：' + diagnosticAdvice : '')
                 + (stateText ? '\nAI状态：' + stateText : '')
                 + (failureText ? '\nAI错误：' + failureText : '');
-            diagnosticPanel = '<div class="llm-ai-diagnostics-panel"><div class="llm-ai-diagnostics-heading">复核遇到问题，可复制诊断信息排查</div><div>AI诊断：' + escapeHtml(diagnosticText) + '</div>'
+            const diagnosticHeading = partialJson ? 'AI结果不完整，可复制诊断信息排查' : '复核遇到问题，可复制诊断信息排查';
+            diagnosticPanel = '<div class="llm-ai-diagnostics-panel"><div class="llm-ai-diagnostics-heading">' + diagnosticHeading + '</div><div>AI诊断：' + escapeHtml(diagnosticText) + '</div>'
                 + (diagnosticAdvice ? '<div>初步判断：' + escapeHtml(diagnosticAdvice) + '</div>' : '')
                 + '<button type="button" class="llm-btn llm-copy-ai-diagnostics" data-ai-diagnostics="' + escapeHtml(copyText) + '">复制 AI 诊断</button></div>';
         }
@@ -2719,6 +3051,103 @@
         return fallbackIndex >= 0
             ? lines.slice(Math.max(0, fallbackIndex - 3), Math.min(lines.length, fallbackIndex + 4)).join(' | ')
             : '';
+    }
+
+    function aiPlanCandidatesFromText(text, options = {}) {
+        const tierPattern = /Free|Go|Lite|Essential|Standard|Pro\+?|Plus|Max|Heavy|Ultra|Team/gi;
+        const result = [];
+        let match;
+        const source = String(text || '');
+        while ((match = tierPattern.exec(source))) {
+            const plan = match[0];
+            const suffix = source.slice(match.index + plan.length, match.index + plan.length + 18);
+            const lineStart = source.lastIndexOf('\n', match.index) + 1;
+            const nextBreak = source.indexOf('\n', match.index);
+            const line = source.slice(lineStart, nextBreak >= 0 ? nextBreak : source.length).trim();
+            const standalone = normalizeAiEvidenceText(line) === normalizeAiEvidenceText(plan);
+            if (options.requirePlanContext && !standalone && !/^\s*(?:plan|套餐|版|choice|推荐|recommended|premium|advanced|$)/i.test(suffix)) continue;
+            if (!result.some(item => normalizePlanKey(item) === normalizePlanKey(plan))) result.push(plan);
+        }
+        return result;
+    }
+
+    function resolveAiPlanFromEvidence(item, sourceText, type = 'price') {
+        const declared = normalizeAiPlanName(item?.plan);
+        if (declared !== '未标注套餐') return declared;
+        const source = String(sourceText || '');
+        const evidence = String(item?.evidence || '');
+        if (!source || !evidence) return declared;
+        const lines = source.split(/\n+/);
+        const quote = normalizeAiEvidenceText(evidence);
+        let lineIndex = lines.findIndex(line => quote && normalizeAiEvidenceText(line).includes(quote));
+        if (lineIndex < 0) {
+            const targetValue = type === 'price' ? Number(item?.amount) : Number(type === 'estimate' ? item?.estimatedTokens : item?.value);
+            if (Number.isFinite(targetValue)) {
+                const matches = lines.map((line, index) => ({ line, index }))
+                    .filter(({ line }) => {
+                        const numbers = aiNumbersInText(line);
+                        const compactLine = normalizeAiEvidenceText(line);
+                        const compactEvidence = normalizeAiEvidenceText(evidence);
+                        return numbers.some(value => Math.abs(value - targetValue) <= Math.max(1e-8, Math.abs(targetValue) * 1e-8))
+                            || (compactEvidence && compactLine.includes(compactEvidence));
+                    });
+                if (matches.length === 1) lineIndex = matches[0].index;
+                else if (matches.length > 1) {
+                    const exactQuoteMatches = matches.filter(({ line }) => normalizeAiEvidenceText(line).includes(normalizeAiEvidenceText(evidence)));
+                    if (exactQuoteMatches.length === 1) lineIndex = exactQuoteMatches[0].index;
+                }
+            }
+        }
+        if (lineIndex < 0) return declared;
+
+        const immediate = lines.slice(Math.max(0, lineIndex - 3), lineIndex + 1).join('\n');
+        const immediatePlans = aiPlanCandidatesFromText(immediate, { requirePlanContext: true });
+        if (immediatePlans.length === 1) return immediatePlans[0];
+
+        const normalizedLines = lines.map(line => normalizeAiEvidenceText(line));
+        const cardStart = normalizedLines.lastIndexOf('套餐卡', lineIndex);
+        const nextCardStart = normalizedLines.indexOf('套餐卡', lineIndex + 1);
+        if (cardStart >= 0 && (nextCardStart < 0 || lineIndex < nextCardStart)) {
+            const cardEnd = nextCardStart >= 0 ? nextCardStart : Math.min(lines.length, cardStart + 20);
+            const cardPlans = aiPlanCandidatesFromText(lines.slice(cardStart, cardEnd).join('\n'), { requirePlanContext: true });
+            if (cardPlans.length === 1) return cardPlans[0];
+        }
+
+        // 纵向套餐卡常把标题放在价格前若干行；遇到新的金额行后停止向上跨卡。
+        const precedingPlans = [];
+        let crossedPreviousAmount = false;
+        for (let index = lineIndex; index >= Math.max(0, lineIndex - 12); index -= 1) {
+            const line = lines[index];
+            if (index < lineIndex && type === 'price' && /(?:¥|￥|CNY|RMB|USD|US\$|€|EUR|£|GBP|JPY|HKD|\$)\s*\d|\d[\d,]*(?:\.\d+)?\s*(?:元|人民币|美元)/i.test(line)) {
+                crossedPreviousAmount = true;
+                continue;
+            }
+            const plans = aiPlanCandidatesFromText(line, { requirePlanContext: true });
+            if (plans.length === 1) return plans[0];
+            plans.forEach(plan => {
+                if (!precedingPlans.some(item => normalizePlanKey(item) === normalizePlanKey(plan))) precedingPlans.push(plan);
+            });
+            if (crossedPreviousAmount && plans.length) break;
+            if (precedingPlans.length > 1) break;
+        }
+        if (precedingPlans.length === 1) return precedingPlans[0];
+
+        // 横向表格按“套餐表头顺序 = 数值列顺序”关联，只有唯一对齐时才采用。
+        const planOrder = aiPlanOrder(source);
+        if (planOrder.length >= 2) {
+            const valueLines = lines.map((line, index) => ({ line, index }))
+                .filter(({ line }) => type === 'price'
+                    ? aiTableCandidateColumns('price', line.split('|')).length >= 2
+                    : aiTableCandidateColumns(type, line.split('|')).length >= 2);
+            const matchingRows = valueLines.filter(({ line }) => aiCellContainsMetric(type, item, line));
+            if (matchingRows.length === 1) {
+                const cells = matchingRows[0].line.split('|').map(cell => cell.trim());
+                const valueColumns = aiTableCandidateColumns(type, cells);
+                const matchingColumn = valueColumns.findIndex(column => aiCellContainsMetric(type, item, cells[column]));
+                if (valueColumns.length === planOrder.length && matchingColumn >= 0) return planOrder[matchingColumn];
+            }
+        }
+        return declared;
     }
 
     function aiGlobalQuotaWindow(sourceText, declaredWindow = '') {
@@ -2958,7 +3387,7 @@
         return aiGlobalQuotaWindow(sourceText, declared);
     }
 
-    function aiPriceCurrencyIsExplicit(currency, evidence) {
+    function aiPriceCurrencyIsExplicit(currency, evidence, sourceText = '', sourceUrl = '') {
         const code = normalizeCurrencyCode(currency);
         const patterns = {
             CNY: /人民币|CNY|RMB|¥|￥|元/i,
@@ -2973,7 +3402,21 @@
             CAD: /CAD|加元|C\$/i,
             INR: /INR|印度卢比|₹/i
         };
-        return Boolean(patterns[code] && patterns[code].test(String(evidence || '')));
+        const quote = String(evidence || '');
+        if (patterns[code]?.test(quote)) return true;
+        if (code !== 'USD' || !/(?:^|[^A-Za-z])[$]\s*\d/.test(quote)) return false;
+
+        // 裸 $ 只有在页面整体币种也可确定为 USD 时才通过，避免中文页面公式或模板变量被误认成美元。
+        const combinedSource = String(sourceText || '');
+        const metaCurrency = combinedSource.match(/确定性推断币种\s*[：:]\s*([A-Z]{3})/i)?.[1] || '';
+        if (normalizeCurrencyCode(metaCurrency) === 'USD') return true;
+        if (/(?:\bUSD\b|\bUS\s*\$|美元)/i.test(combinedSource)) return true;
+        try {
+            const host = new URL(sourceUrl).hostname.toLowerCase();
+            return host === 'github.com' || host.endsWith('.github.com') || host === 'openai.com' || host.endsWith('.openai.com') || host === 'x.ai' || host.endsWith('.x.ai') || host === 'grok.com' || host.endsWith('.grok.com');
+        } catch {
+            return false;
+        }
     }
 
     function aiNumbersInText(text) {
@@ -3047,7 +3490,7 @@
             if (!Number.isFinite(amount) || amount < 0 || !aiEvidenceContainsValue(type, item, evidence)) {
                 issues.push('原文证据中找不到对应价格数值');
             }
-            if (!aiPriceCurrencyIsExplicit(item.currency, evidence)) issues.push('原文证据没有明确支持所标币种');
+            if (!aiPriceCurrencyIsExplicit(item.currency, evidence, sourceText, snapshot?.sourceUrl || '')) issues.push('原文证据没有明确支持所标币种');
         } else {
             const parsed = type === 'quota'
                 ? parseQuotaValue(item.value, item.unit)
@@ -3075,7 +3518,7 @@
 
     function getAiSnapshotReview(snapshot) {
         const sourceData = snapshot?.data && typeof snapshot.data === 'object' ? snapshot.data : {};
-        const data = { ...sourceData, prices: [], quotas: [], modelEstimates: [] };
+        const data = { ...sourceData, prices: [], quotas: [], unclassifiedQuotas: Array.isArray(sourceData.unclassifiedQuotas) ? sourceData.unclassifiedQuotas : [], modelEstimates: [] };
         const exceptions = [];
         const fieldDecisions = snapshot?.fieldDecisions && typeof snapshot.fieldDecisions === 'object' ? snapshot.fieldDecisions : {};
         const counts = { automatic: 0, accepted: 0, ignored: 0, pending: 0 };
@@ -3084,10 +3527,15 @@
 
         const conflictedKeys = aiDataConflictKeys(sourceData);
         const process = (type, rows, destination) => {
-            const knownPlans = [...new Set((Array.isArray(rows) ? rows : [])
+            const preparedRows = (Array.isArray(rows) ? rows : []).map(item => {
+                const normalizedPlan = normalizeAiPlanName(item?.plan);
+                const resolvedPlan = resolveAiPlanFromEvidence({ ...item, plan: normalizedPlan }, snapshot?.evidenceText || snapshot?.excerpt || '', type);
+                return resolvedPlan !== normalizedPlan ? { ...item, plan: resolvedPlan } : { ...item, plan: normalizedPlan };
+            });
+            const knownPlans = [...new Set(preparedRows
                 .map(item => String(item?.plan || '').trim())
                 .filter(plan => plan && plan !== '未标注套餐'))];
-            (Array.isArray(rows) ? rows : []).forEach(item => {
+            preparedRows.forEach(item => {
                 const key = aiFieldKey(type, item);
                 const decision = String(fieldDecisions[key] || '');
                 const issues = aiFieldIssue(snapshot, type, item, conflictedKeys, knownPlans);
