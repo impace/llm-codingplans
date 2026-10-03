@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.15.9
+// @version      2.16.1
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.15.9';
+    const APP_VERSION = '2.16.1';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -243,7 +243,7 @@
     const MAX_AI_EVIDENCE_CHARS = 18000;
     const MAX_AI_FIELD_EVIDENCE_CHARS = 220;
     const MAX_AI_SOURCE_CHARS = 180000;
-    const AI_REVIEW_POLICY_VERSION = 5;
+    const AI_REVIEW_POLICY_VERSION = 6;
     const REQUEST_TOKEN_SCENARIOS = {
         conservative: 8000,
         baseline: 32000,
@@ -960,6 +960,99 @@
         return { ...priceFacts, plans, modelEvents, signals, confidence };
     }
 
+    function deterministicPriceEvidence(source, raw, usedIndexes = new Set()) {
+        const text = String(source || '');
+        const token = String(raw || '').trim();
+        if (!text || !token) return { evidence: token, index: -1 };
+        const escaped = token.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+        const pattern = new RegExp(escaped, 'gi');
+        let match;
+        while ((match = pattern.exec(text))) {
+            if (!usedIndexes.has(match.index)) {
+                const leftBoundary = Math.max(
+                    text.lastIndexOf('\\n', match.index),
+                    text.lastIndexOf('；', match.index),
+                    text.lastIndexOf(';', match.index),
+                    text.lastIndexOf('。', match.index),
+                    text.lastIndexOf('.', match.index),
+                    text.lastIndexOf('!', match.index),
+                    text.lastIndexOf('?', match.index)
+                );
+                const rightCandidates = ['\\n', '；', ';', '。', '.', '!', '?']
+                    .map(separator => text.indexOf(separator, match.index + token.length))
+                    .filter(index => index >= 0);
+                const start = Math.max(leftBoundary + 1, match.index - 180, 0);
+                const end = Math.min(rightCandidates.length ? Math.min(...rightCandidates) + 1 : text.length, match.index + token.length + 180);
+                return { evidence: text.slice(start, end).replace(/\s+/g, ' ').trim(), index: match.index };
+            }
+        }
+        return { evidence: token, index: -1 };
+    }
+
+    function deterministicPlanFromEvidence(evidence, plans) {
+        const text = String(evidence || '');
+        const candidates = Array.isArray(plans) ? plans : [];
+        const matches = candidates.filter(plan => new RegExp('(^|[^A-Za-z])' + String(plan).replace(/[\\^$.*+?()[\]{}|]/g, '\\$&') + '(?=$|[^A-Za-z])', 'i').test(text));
+        return matches.length === 1 ? normalizeAiPlanName(matches[0]) : '未标注套餐';
+    }
+
+    function deterministicBillingPeriod(evidence) {
+        const text = String(evidence || '').toLowerCase();
+        if (/每月|月付|月度|monthly|per\s*month|\/month|\/月/.test(text)) return 'monthly';
+        if (/每年|年付|年度|yearly|annual|per\s*year|\/year|\/年/.test(text)) return 'yearly';
+        if (/一次性|单次|one[- ]?time/.test(text)) return 'one_time';
+        return 'unknown';
+    }
+
+    function buildDeterministicFallbackExtraction(sourceText, url, extractFacts, rates) {
+        const facts = extractFacts && typeof extractFacts === 'object' ? extractFacts : extractDeterministicFacts(sourceText, url);
+        const source = String(sourceText || '');
+        const plans = Array.isArray(facts.plans) ? facts.plans : [];
+        const usedIndexes = new Set();
+        const prices = [];
+        (Array.isArray(facts.prices) ? facts.prices : []).forEach(fact => {
+            const amount = Number(fact?.amount);
+            const currency = normalizeCurrencyCode(fact?.currency);
+            if (!Number.isFinite(amount) || amount < 0 || currency === 'UNKNOWN') return;
+            const evidenceInfo = deterministicPriceEvidence(source, fact.raw, usedIndexes);
+            if (evidenceInfo.index >= 0) usedIndexes.add(evidenceInfo.index);
+            const evidence = evidenceInfo.evidence || String(fact.raw || '');
+            if (prices.some(item => item.amount === amount && item.currency === currency && item.evidence === evidence)) return;
+            prices.push({
+                plan: deterministicPlanFromEvidence(evidence, plans),
+                amount,
+                currency,
+                billingPeriod: deterministicBillingPeriod(evidence),
+                amountCny: Number.isFinite(fact.amountCny) ? fact.amountCny : convertToCny(amount, currency, rates),
+                evidence: evidence.slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
+            });
+        });
+        if (!prices.length) return null;
+        return {
+            confidence: 'low',
+            needsReview: true,
+            changeSummary: 'AI 未完整返回，仅采用脚本确定性识别到的价格；其他字段未确认',
+            pageCurrency: normalizeCurrencyCode(facts.inferredCurrency),
+            prices: prices.slice(0, 20),
+            quotas: [],
+            unclassifiedQuotas: [],
+            modelEstimates: [],
+            models: [],
+            technicalLimits: [],
+            warnings: [
+                'AI 未完整返回，仅采用脚本确定性识别到的价格',
+                '套餐归属、计费周期和价格上下文未被 AI 完整确认；未自动猜测额度、积分、Credits 或请求次数',
+                '请重新分析以获取完整结构化结果'
+            ]
+        };
+    }
+
+    function isStructuredOutputUnsupported(responseText, status) {
+        if (Number(status) !== 400) return false;
+        const message = String(responseText || '').toLowerCase();
+        return /response[_ -]?format|json[_ -]?object|reasoning[_ -]?effort|unknown parameter.*(?:response|reasoning)|unsupported.*(?:response|reasoning|json)|unrecognized.*(?:response|reasoning|json)/.test(message);
+    }
+
     function buildAiExcerpt(text) {
         const source = sanitizeProbeText(text);
         if (source.length <= MAX_AI_EXCERPT_CHARS) return source;
@@ -1526,6 +1619,7 @@
         const retryStage = Math.max(0, Math.min(2, Number(sourceResult.aiRetryStage) || (sourceResult.aiCompactRetry ? 1 : 0)));
         const compactRetry = retryStage >= 1;
         const minimalRetry = retryStage >= 2;
+        const structuredOutputAttempt = retryStage >= 1 && !sourceResult.aiStructuredOutputFallback;
         if (!ai.enabled || !String(ai.apiKey || '').trim()) {
             return Promise.resolve({
                 ok: false,
@@ -1563,7 +1657,8 @@
         const evidenceDiagnostics = {
             sourceChars: sourceText.length,
             evidenceChars: text.length,
-            automaticRetries: retryStage
+            automaticRetries: retryStage,
+            structuredOutputFallback: Boolean(sourceResult.aiStructuredOutputFallback)
         };
         if (text.length < 120) return Promise.resolve({
             ok: false,
@@ -1597,7 +1692,7 @@
             '每条 evidence 最多 160 字，必须是证据包中的连续原文；不要把分开的表头行和数据行拼接，也不要自行插入 | 或补写文字。证据可以只引用目标数值片段，套餐名必须单独填写在 plan 字段。无法确认套餐归属、周期或数值时写入 warnings；相同模型和套餐不要重复返回。',
             '没有同时看到明确模型、套餐和 Token 数值时，不要生成 modelEstimates；请求次数、Credits、积分不能转成 Token。'
         ].filter(Boolean);
-        const prompt = [
+        let prompt = [
             '你是订阅与价格页面的数据审计器。请从下面脚本预处理后的官方页面证据包中抽取结构化数据。',
             ...taskInstructions,
             '你收到的不是完整网页，而是脚本筛选后的证据包；只允许依据证据包中明确出现的内容。',
@@ -1630,6 +1725,50 @@
             '筛选后的 AI 证据包：',
             text
         ].join('\n');
+        if (compactRetry) {
+            const compactSchema = isUpdateSource ? {
+                confidence: 'low',
+                needsReview: true,
+                models: [],
+                warnings: [],
+                changeSummary: ''
+            } : {
+                confidence: 'low',
+                needsReview: true,
+                pageCurrency: 'UNKNOWN',
+                prices: [],
+                quotas: [],
+                unclassifiedQuotas: [],
+                modelEstimates: [],
+                models: [],
+                warnings: [],
+                changeSummary: ''
+            };
+            prompt = [
+                '只做极简结构化抽取。不要分析、解释、复述证据或输出 Markdown。必须只返回一个完整 JSON 对象；看不清的字段填空数组，不能猜。',
+                isUpdateSource
+                    ? '更新页只填写 models、warnings、changeSummary。'
+                    : '定价页只填写确定看到的价格、额度、模型 Token 估算和 warnings。积分、Credits、请求数不能换算成 Token；无法对应套餐就写未标注套餐。',
+                '价格最多 8 条，quotas 最多 8 条，modelEstimates 最多 8 条，unclassifiedQuotas 最多 6 条，models 最多 6 条，warnings 最多 3 条。所有 evidence 必须是证据包连续原文。',
+                '输出模板：' + JSON.stringify(compactSchema),
+                '来源 URL：' + url,
+                '证据包：',
+                text
+            ].join('\n');
+        }
+        const requestBody = {
+            model: String(ai.model || 'gpt-4o-mini'),
+            temperature: 0,
+            max_tokens: minimalRetry ? (isUpdateSource ? 700 : 1000) : compactRetry ? (isUpdateSource ? 1000 : 2000) : (isUpdateSource ? 1500 : 3600),
+            messages: [
+                { role: 'system', content: '你是严格的 JSON 抽取器。只输出一个完整 JSON 对象。禁止输出思考过程、分析、解释、前言、后记或 Markdown。若证据不足，使用空数组和 warnings，不要补猜。' },
+                { role: 'user', content: prompt }
+            ]
+        };
+        if (structuredOutputAttempt) {
+            requestBody.response_format = { type: 'json_object' };
+            requestBody.reasoning_effort = 'none';
+        }
         return new Promise(resolve => {
             const startedAt = Date.now();
             const headers = { 'Content-Type': 'application/json' };
@@ -1640,15 +1779,7 @@
                 timeout: timeoutSeconds * 1000,
                 anonymous: true,
                 headers,
-                data: JSON.stringify({
-                    model: String(ai.model || 'gpt-4o-mini'),
-                    temperature: 0,
-                    max_tokens: minimalRetry ? (isUpdateSource ? 700 : 1000) : compactRetry ? (isUpdateSource ? 1000 : 2000) : (isUpdateSource ? 1500 : 3600),
-                    messages: [
-                        { role: 'system', content: '你是 JSON 抽取器。只输出一个完整 JSON 对象，不要输出思考过程、解释、前后缀或 Markdown。' },
-                        { role: 'user', content: prompt }
-                    ]
-                }),
+                data: JSON.stringify(requestBody),
                 onload: response => {
                     const responseText = String(response.responseText || '');
                     const diagnostics = buildAiDiagnostics(endpoint, model, '收到响应', {
@@ -1662,6 +1793,10 @@
                         ...evidenceDiagnostics
                     });
                     if (Number(response.status) < 200 || Number(response.status) >= 300) {
+                        if (structuredOutputAttempt && isStructuredOutputUnsupported(responseText, response.status)) {
+                            requestAiExtraction(url, { ...sourceResult, aiRetryStage: 2, aiStructuredOutputFallback: true }, reason + '；结构化输出参数不兼容，自动回退到最终极简请求').then(resolve);
+                            return;
+                        }
                         resolve({ ok: false, error: 'AI HTTP ' + response.status + '：' + summarizeAiResponse(responseText), diagnostics: { ...diagnostics, ...evidenceDiagnostics } });
                         return;
                     }
@@ -1682,8 +1817,27 @@
                                 const retryCause = /^length$/i.test(extracted.finishReason)
                                     ? '模型输出达到长度上限'
                                     : '模型输出无法解析为完整 JSON';
-                                requestAiExtraction(url, { ...sourceResult, aiRetryStage: retryStage + 1 }, reason + '；' + retryCause + '，自动压缩重试').then(resolve);
+                                requestAiExtraction(url, { ...sourceResult, aiRetryStage: retryStage + 1, aiStructuredOutputFallback: Boolean(sourceResult.aiStructuredOutputFallback) }, reason + '；' + retryCause + '，自动压缩重试').then(resolve);
                                 return;
+                            }
+                            if (!isUpdateSource) {
+                                const fallbackData = buildDeterministicFallbackExtraction(sourceText, url, sourceResult.extractFacts, fx);
+                                if (fallbackData) {
+                                    diagnostics.deterministicFallback = true;
+                                    diagnostics.phase = '确定性结果降级';
+                                    diagnostics.recoveredPartialJson = true;
+                                    resolve({
+                                        ok: true,
+                                        status: Number(response.status),
+                                        model: ai.model,
+                                        checkedAt: new Date().toISOString(),
+                                        needsReview: true,
+                                        data: fallbackData,
+                                        evidenceText: text,
+                                        diagnostics
+                                    });
+                                    return;
+                                }
                             }
                             const contentSummary = sanitizeAiDiagnosticText(content || extracted.reasoning || summarizeAiResponse(responseText));
                             const truncation = /^length$/i.test(extracted.finishReason) ? '；模型输出达到长度上限，JSON 未闭合' : '';
@@ -1793,8 +1947,10 @@
             result.aiExtraction = aiResult.data;
             delete result.previousAiExtraction;
             result.aiReused = false;
-            result.aiStatus = partialAiResult
-                ? 'AI提取完成但结果不完整：仅采用已完成字段，未完成字段未纳入测算'
+            result.aiStatus = aiResult.diagnostics?.deterministicFallback
+                ? 'AI未完整返回：已采用脚本确定性识别的价格，其他字段未确认'
+                : partialAiResult
+                    ? 'AI提取完成但结果不完整：仅采用已完成字段，未完成字段未纳入测算'
                 : 'AI提取完成，正在自动核验证据';
             result.aiCheckedAt = aiResult.checkedAt;
             result.aiModel = aiResult.model;
@@ -1802,7 +1958,7 @@
             saveAiSnapshot(url, {
                 sourceKind: result.sourceKind,
                 fingerprint: result.fingerprint || '',
-                status: partialAiResult ? '部分恢复' : '自动筛选',
+                status: aiResult.diagnostics?.deterministicFallback ? '确定性降级' : (partialAiResult ? '部分恢复' : '自动筛选'),
                 reviewPolicyVersion: AI_REVIEW_POLICY_VERSION,
                 fieldDecisions: {},
                 checkedAt: aiResult.checkedAt,
@@ -2678,6 +2834,9 @@
             if (review.unsupported) return { kind: 'action', label: '旧版 AI 数据已停用，请重新抓取分析', color: '#e3b341' };
             const partial = Boolean(displayProbe.aiDiagnostics?.recoveredPartialJson || snapshot?.diagnostics?.recoveredPartialJson || snapshot?.status === '部分恢复' || /结果不完整/.test(status));
             const applied = review.counts.automatic + review.counts.accepted;
+            if (displayProbe.aiDiagnostics?.deterministicFallback || snapshot?.diagnostics?.deterministicFallback) {
+                return { kind: 'attention', label: 'AI未完整返回：已采用脚本确定性识别的价格；其他字段未确认', color: '#e3b341' };
+            }
             if (partial && review.counts.pending) {
                 return { kind: 'attention', label: 'AI结果不完整：已采用 ' + applied + ' 项；另有 ' + review.counts.pending + ' 项证据异常待处理，未完成字段未纳入测算', color: '#e3b341' };
             }
@@ -2735,6 +2894,7 @@
             Number.isFinite(Number(diagnostics.sourceChars)) ? '原始正文 ' + Number(diagnostics.sourceChars).toLocaleString() + ' 字' : '',
             Number.isFinite(Number(diagnostics.evidenceChars)) ? '证据包 ' + Number(diagnostics.evidenceChars).toLocaleString() + ' 字' : '',
             Number(diagnostics.automaticRetries) > 0 ? '自动重试 ' + Number(diagnostics.automaticRetries) + ' 次' : '',
+            diagnostics.structuredOutputFallback ? '结构化输出参数不兼容，已自动回退' : '',
             diagnostics.reason ? '原因 ' + diagnostics.reason : ''
         ].filter(Boolean);
         return parts.join('；');
@@ -2744,6 +2904,7 @@
         if (!diagnostics || typeof diagnostics !== 'object') return '';
         const status = Number(diagnostics.httpStatus) || 0;
         const phase = String(diagnostics.phase || '');
+        if (diagnostics.deterministicFallback || phase === '确定性结果降级') return '模型未返回完整 JSON；脚本仅采用确定性识别到的价格，套餐归属、额度、积分和请求次数未自动猜测';
         if (diagnostics.recoveredPartialJson || phase === '模型内容部分恢复') return '接口调用成功，但模型 JSON 未完整闭合；脚本只保留了已完成字段，未完成字段未纳入测算，建议重新分析';
         if (phase === '请求前校验') return '请求未发送：请先解决正文完整性问题';
         if (phase === '配置检查') return '请求未发送：请检查 AI 开关、API Key 与 Endpoint';
@@ -2774,6 +2935,7 @@
         const snapshotStatus = String(snapshot?.status || '').trim();
         const effectiveStatus = aiStatus || snapshotStatus;
         const partialJson = Boolean(displayProbe.aiDiagnostics?.recoveredPartialJson || snapshot?.diagnostics?.recoveredPartialJson || snapshotStatus === '部分恢复' || /结果不完整/.test(effectiveStatus));
+        const deterministicFallback = Boolean(displayProbe.aiDiagnostics?.deterministicFallback || snapshot?.diagnostics?.deterministicFallback || snapshotStatus === '确定性降级');
         const aiFailed = /^AI失败/.test(aiStatus) || (!aiStatus && snapshotStatus === '失败');
         const aiNotExecuted = /^AI未执行/.test(aiStatus) || (!aiStatus && snapshotStatus === '未执行');
         const failureText = aiFailed
@@ -2804,7 +2966,9 @@
                     + (review.counts.ignored ? '；已忽略 ' + review.counts.ignored + ' 项' : '')
                     + (review.counts.pending ? '；' + review.counts.pending + ' 项异常未纳入测算' : '');
                 parts.push(label + escapeHtml(formatAiSnapshot({ data: review.data })) + '；' + escapeHtml(summary));
-                if (partialJson) {
+                if (deterministicFallback) {
+                    parts.push('<span style="color:#e3b341;">AI警告：模型未完整返回，仅采用脚本确定性识别到的价格；套餐归属、额度、积分和请求次数未自动猜测。</span>');
+                } else if (partialJson) {
                     parts.push('<span style="color:#e3b341;">AI警告：本次响应 JSON 未完整闭合，仅采用已完成字段；未完成字段未纳入测算，建议重新分析。</span>');
                 }
                 if (review.exceptions.length) {
@@ -2838,13 +3002,15 @@
         } else if (aiNotExecuted && stateText && diagnosticText) {
             parts.push('AI状态：' + escapeHtml(stateText));
         }
-        const hasAiIssue = aiFailed || aiNotExecuted || /未复核/.test(effectiveStatus) || partialJson;
+        const hasAiIssue = aiFailed || aiNotExecuted || /未复核/.test(effectiveStatus) || partialJson || deterministicFallback;
         if (diagnosticText && hasAiIssue) {
             const copyText = 'AI诊断：' + diagnosticText
                 + (diagnosticAdvice ? '\n初步判断：' + diagnosticAdvice : '')
                 + (stateText ? '\nAI状态：' + stateText : '')
                 + (failureText ? '\nAI错误：' + failureText : '');
-            const diagnosticHeading = partialJson ? 'AI结果不完整，可复制诊断信息排查' : '复核遇到问题，可复制诊断信息排查';
+            const diagnosticHeading = deterministicFallback
+                ? 'AI未完整返回，已使用确定性价格结果'
+                : partialJson ? 'AI结果不完整，可复制诊断信息排查' : '复核遇到问题，可复制诊断信息排查';
             diagnosticPanel = '<div class="llm-ai-diagnostics-panel"><div class="llm-ai-diagnostics-heading">' + diagnosticHeading + '</div><div>AI诊断：' + escapeHtml(diagnosticText) + '</div>'
                 + (diagnosticAdvice ? '<div>初步判断：' + escapeHtml(diagnosticAdvice) + '</div>' : '')
                 + '<button type="button" class="llm-btn llm-copy-ai-diagnostics" data-ai-diagnostics="' + escapeHtml(copyText) + '">复制 AI 诊断</button></div>';
