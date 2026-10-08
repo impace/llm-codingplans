@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         大模型代码订阅对比与更新雷达 (LLM CodePlans Pro)
 // @namespace    https://github.com/impace/llm-codingplans
-// @version      2.16.1
+// @version      2.16.4
 // @description  大模型代码订阅对比、动态更新追踪、AI辅助结构化抽取与购物车式用量测算工具
 // @author       impace
 // @match        *://*/*
@@ -230,7 +230,7 @@
     ];
 
     // ======================== 2. 基础配置与探针工具 ========================
-    const APP_VERSION = '2.16.1';
+    const APP_VERSION = '2.16.4';
     const PROVIDER_SETTINGS_KEY = 'llm_provider_settings_v2';
     const APP_SETTINGS_KEY = 'llm_app_settings_v1';
     const SOURCE_PROBE_KEY_PREFIX = 'llm_source_probe_v2_';
@@ -243,7 +243,7 @@
     const MAX_AI_EVIDENCE_CHARS = 18000;
     const MAX_AI_FIELD_EVIDENCE_CHARS = 220;
     const MAX_AI_SOURCE_CHARS = 180000;
-    const AI_REVIEW_POLICY_VERSION = 6;
+    const AI_REVIEW_POLICY_VERSION = 9;
     const REQUEST_TOKEN_SCENARIOS = {
         conservative: 8000,
         baseline: 32000,
@@ -1396,6 +1396,26 @@
         return raw.slice(0, 120);
     }
 
+    function isGenericOfferZeroPrice(item) {
+        const row = item && typeof item === 'object' ? item : {};
+        const amount = Number(row.amount);
+        const plan = normalizeAiPlanName(row.plan);
+        const evidence = String(row.evidence || '').normalize('NFKC');
+        if (amount !== 0 || plan !== '未标注套餐') return false;
+        if (!/@type|priceCurrency|offers?|Offer/i.test(evidence)) return false;
+        return !/(?:free|免费|免费版|零元|0\s*(?:\/|per)\s*(?:month|月)|\$0\s*(?:\/|per))/i.test(evidence);
+    }
+
+    function isInvalidAiModelEstimate(item) {
+        const row = item && typeof item === 'object' ? item : {};
+        const model = String(row.model || row.modelName || '').trim();
+        const unit = String(row.estimatedUnit || row.unit || '').trim();
+        const value = Number(row.estimatedTokens ?? row.value);
+        if (!model || !Number.isFinite(value) || value <= 0) return true;
+        if (!unit || /^(?:unknown|未知|不详|n\/?a|null)$/i.test(unit)) return true;
+        return /不同套餐档位|套餐档位可用|可用\s*token\s*(?:数|数量)?\s*预估|token\s*(?:用量|额度)\s*(?:预估|估算)/i.test(model);
+    }
+
     function classifyAiQuotaRecord(item) {
         const row = item && typeof item === 'object' ? item : {};
         const text = [row.value, row.unit, row.window, row.evidence].map(value => String(value || '')).join(' ').normalize('NFKC');
@@ -1405,6 +1425,7 @@
             return { measurable: false, reason: '不限量描述没有可安全量化的数值' };
         }
         if (kind === 'unknown') return { measurable: false, reason: '非 Token、请求数或 Credits 的额度单位' };
+        if (kind === 'credits') return { measurable: false, reason: 'Credits/积分不能直接折算为 Token，已保留为非标准额度' };
         if (!Number.isFinite(parsed.value) || parsed.value <= 0) return { measurable: false, reason: '额度没有可安全量化的正数值' };
         return { measurable: true, reason: '' };
     }
@@ -1539,7 +1560,7 @@
                 amountCny: Number.isFinite(amountCny) ? amountCny : null,
                 evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
-        }).filter(item => item.amount !== null) : [];
+        }).filter(item => item.amount !== null && !isGenericOfferZeroPrice(item)) : [];
         const technicalLimits = [];
         const unclassifiedQuotas = Array.isArray(source.unclassifiedQuotas)
             ? source.unclassifiedQuotas.slice(0, 30).map(item => normalizeUnclassifiedQuota(item, item?.reason || 'AI 标记为非标准额度'))
@@ -1585,7 +1606,7 @@
                 basis: String(row.basis || '页面估算').trim().slice(0, 120),
                 evidence: String(row.evidence || '').trim().slice(0, MAX_AI_FIELD_EVIDENCE_CHARS)
             };
-        }).filter(item => item.model && item.estimatedTokens !== '').filter(item => {
+        }).filter(item => item.model && item.estimatedTokens !== '' && !isInvalidAiModelEstimate(item)).filter(item => {
             if (!isTechnicalLimitRecord('estimate', item)) return true;
             technicalLimits.push(normalizeTechnicalLimit('estimate', item));
             return false;
@@ -3213,7 +3234,8 @@
         }
         const quantities = aiNumbersInText(evidence);
         const unitPattern = /tokens?|credits?|points?|requests?|calls?|messages?|积分|点数|次|请求|调用/i;
-        const fallbackIndex = lines.findIndex(line => quantities.some(value => line.includes(String(value).replace(/,/g, ''))) && unitPattern.test(line));
+        const pricePattern = /(?:¥|￥|元|人民币|CNY|RMB|USD|US\$|美元|€|EUR|£|GBP|日元|JPY|港币|HKD|₩|KRW|\$)\s*\d|\d[\d,]*(?:\.\d+)?\s*(?:元|人民币|USD|US\$|美元|EUR|GBP|JPY|HKD|KRW|\$)/i;
+        const fallbackIndex = lines.findIndex(line => quantities.some(value => line.includes(String(value).replace(/,/g, ''))) && (unitPattern.test(line) || pricePattern.test(line)));
         return fallbackIndex >= 0
             ? lines.slice(Math.max(0, fallbackIndex - 3), Math.min(lines.length, fallbackIndex + 4)).join(' | ')
             : '';
@@ -3585,6 +3607,47 @@
         }
     }
 
+    function aiPriceSourceEvidenceSupported(item, evidence, sourceText, sourceUrl = '') {
+        const amount = Number(item?.amount);
+        const source = String(sourceText || '').normalize('NFKC');
+        const quote = String(evidence || '').trim();
+        if (!Number.isFinite(amount) || amount < 0 || !source) return false;
+        const normalizedSource = normalizeAiEvidenceText(source);
+        const normalizedQuote = normalizeAiEvidenceText(quote);
+        if (normalizedQuote.length >= 6 && normalizedSource.includes(normalizedQuote)
+            && aiPriceCurrencyIsExplicit(item.currency, quote, source, sourceUrl)) return true;
+
+        const currencyPattern = {
+            CNY: /人民币|CNY|RMB|¥|￥|元/i,
+            USD: /美元|USD|US\$|\$/i,
+            EUR: /EUR|欧元|€/i,
+            GBP: /GBP|英镑|£/i,
+            JPY: /JPY|日元|円|¥/i,
+            HKD: /HKD|港币|HK\$/i,
+            KRW: /KRW|韩元|₩/i,
+            SGD: /SGD|新币|S\$/i,
+            AUD: /AUD|澳元|A\$/i,
+            CAD: /CAD|加元|C\$/i,
+            INR: /INR|印度卢比|₹/i
+        }[normalizeCurrencyCode(item.currency)];
+        if (!currencyPattern) return false;
+        const lines = source.split(/\n+/);
+        const plan = normalizeAiPlanName(item.plan);
+        const candidates = [];
+        lines.forEach((line, index) => {
+            const start = Math.max(0, index - 1);
+            const end = Math.min(lines.length, index + 2);
+            const context = lines.slice(start, end).join(' | ');
+            if (!aiNumbersInText(context).some(value => Math.abs(value - amount) <= Math.max(1e-8, Math.abs(amount) * 1e-8))) return;
+            if (!currencyPattern.test(context)) return;
+            if (plan !== '未标注套餐' && !aiEvidenceContainsPlan(plan, context)) return;
+            candidates.push({ index, context });
+        });
+        const uniqueCandidates = candidates.filter((candidate, index, list) => index === list.findIndex(item => item.context === candidate.context));
+        if (plan !== '未标注套餐') return uniqueCandidates.length > 0;
+        return uniqueCandidates.length === 1;
+    }
+
     function aiNumbersInText(text) {
         return [...String(text || '').normalize('NFKC').matchAll(/\d[\d,，]*(?:\.\d+)?/g)]
             .map(match => Number(String(match[0]).replace(/[,，]/g, '')))
@@ -3637,6 +3700,12 @@
             : null;
         const sourceContext = aiEvidenceSourceContext(sourceText, evidence);
         const tableContextSupported = type !== 'price' && aiTableContextSupportsItem(type, item, tableMatch, sourceContext);
+        const priceEvidenceSupported = type === 'price'
+            ? aiPriceSourceEvidenceSupported(item, evidence, sourceText, snapshot?.sourceUrl || '')
+            : false;
+        const priceEvidenceContext = type === 'price'
+            ? [sourceContext, tableMatch?.contextText || ''].filter(Boolean).join(' | ')
+            : '';
         if (!item.plan || item.plan === '未标注套餐') {
             issues.push('AI 未提供明确套餐名');
         } else if (evidence && !aiEvidenceContainsPlan(item.plan, evidence)
@@ -3649,11 +3718,13 @@
         } else {
             const quote = normalizeAiEvidenceText(evidence);
             const source = normalizeAiEvidenceText(sourceText);
-            if ((quote.length < 6 || !source.includes(quote)) && !tableMatch) issues.push('引用不是网页中的连续原文，且无法通过表格行列核实');
+            if ((quote.length < 6 || !source.includes(quote)) && !tableMatch && !(type === 'price' && priceEvidenceSupported)) {
+                issues.push('引用不是网页中的连续原文，且无法通过表格行列核实');
+            }
         }
         if (type === 'price') {
             const amount = Number(item.amount);
-            if (!Number.isFinite(amount) || amount < 0 || !aiEvidenceContainsValue(type, item, evidence)) {
+            if (!Number.isFinite(amount) || amount < 0 || !priceEvidenceSupported) {
                 issues.push('原文证据中找不到对应价格数值');
             }
             if (!aiPriceCurrencyIsExplicit(item.currency, evidence, sourceText, snapshot?.sourceUrl || '')) issues.push('原文证据没有明确支持所标币种');
